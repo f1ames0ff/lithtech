@@ -2,8 +2,10 @@
 #include "fear_renderer_stub.h"
 #include "fear_render_api.h"
 #include "fear_host_api.h"
+#include "fear_object_map.h"
 #include <stdio.h>
 #include <string.h>
+#include <math.h>
 #include "rendererframestats.h"
 
 template <typename T> struct SvcDefault { static T Get() { return T(); } };
@@ -215,6 +217,27 @@ LTRESULT CFearRenderer::RenderCamera(HLOCALOBJ hCamera, const char *pTechniqueOv
     const FearRenderApi *pRender = FearRender();
     if (!pRender || !pRender->RenderWorld)
         return LT_UNSUPPORTED;
+
+    float position[3] = {0.0f, 0.0f, 0.0f};
+    float rotation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    if (hCamera && FearClient_GetObjectTransform(hCamera, position, rotation) && pRender->SetWorldCamera)
+    {
+        const float qx = rotation[0];
+        const float qy = rotation[1];
+        const float qz = rotation[2];
+        const float qw = rotation[3];
+        const float tx = 2.0f * (qy * 1.0f - qz * 0.0f);
+        const float ty = 2.0f * (qz * 0.0f - qx * 1.0f);
+        const float tz = 2.0f * (qx * 0.0f - qy * 0.0f);
+        const float fx = 0.0f + qw * tx + (qy * tz - qz * ty);
+        const float fy = 0.0f + qw * ty + (qz * tx - qx * tz);
+        const float fz = 1.0f + qw * tz + (qx * ty - qy * tx);
+
+        float yaw = atan2f(fx, fz);
+        float pitch = asinf(fy < -1.0f ? -1.0f : (fy > 1.0f ? 1.0f : fy));
+        pRender->SetWorldCamera(position, yaw, pitch);
+    }
+
     return pRender->RenderWorld() ? LT_OK : LT_ERROR;
 }
 
@@ -238,8 +261,11 @@ LTRESULT CFearRenderer::MakeCubicEnvMap(const LTVector& vCenter, uint32 nSize, c
 
 LTRESULT CFearRenderer::MakeScreenShot(const char* pszFile)
 {
-    FEAR_UNIMPL_LOG("ILTRenderer::MakeScreenShot");
-    return SvcDefault<LTRESULT>::Get();
+    FEAR_FWD_LOG("ILTRenderer::MakeScreenShot");
+    const FearRenderApi *pRender = FearRender();
+    if (!pRender || !pRender->MakeScreenShot)
+        return LT_UNSUPPORTED;
+    return pRender->MakeScreenShot(pszFile) ? LT_OK : LT_ERROR;
 }
 
 LTRESULT CFearRenderer::CreateRenderTarget(uint32 nWidth, uint32 nHeight, uint32 nOptions, HRENDERTARGET& hTarget)

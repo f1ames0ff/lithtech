@@ -4,6 +4,7 @@
 #include "MissionMgr.h"
 #include "ClientConnectionMgr.h"
 #include "PlayerMgr.h"
+#include "PlayerCamera.h"
 #include "MsgIDs.h"
 #include "AutoMessage.h"
 
@@ -64,6 +65,54 @@ extern "C" __declspec(dllexport) void FearClient_ReplySaveFailed()
     cMsg.Writeuint8(MID_SAVE_DATA);
     cMsg.Writebool(true);
     g_pLTClient->SendToServer(cMsg.Read(), MESSAGE_GUARANTEED);
+}
+
+extern "C" __declspec(dllexport) int FearClient_IsPlaying()
+{
+    return (g_pInterfaceMgr && g_pInterfaceMgr->GetGameState() == GS_PLAYING) ? 1 : 0;
+}
+
+extern "C" __declspec(dllexport) int FearClient_PreparePortPlayer(void *hTarget)
+{
+    if (!g_pPlayerMgr || !hTarget)
+        return 0;
+
+    CPlayerCamera *pCamera = g_pPlayerMgr->GetPlayerCamera();
+    if (!pCamera || !pCamera->GetCamera())
+        return 0;
+
+    pCamera->SetCameraMode(CPlayerCamera::kCM_FirstPerson);
+    pCamera->SetTargetObject((HOBJECT)hTarget);
+    pCamera->Update();
+    return 1;
+}
+
+extern "C" __declspec(dllexport) void FearClient_RenderPortCamera()
+{
+    if (!g_pPlayerMgr || !g_pLTClient)
+        return;
+
+    CPlayerCamera *pCamera = g_pPlayerMgr->GetPlayerCamera();
+    if (!pCamera || !pCamera->GetCamera())
+        return;
+
+    ILTRenderer *pRenderer = g_pLTClient->GetRenderer();
+    if (!pRenderer || pRenderer->Start3D() != LT_OK)
+        return;
+
+    pCamera->Update();
+    pCamera->Render();
+    if (g_pInterfaceMgr && g_pInterfaceMgr->IsInGame())
+        g_pInterfaceMgr->Draw();
+
+    static int s_nPortFrame = 0;
+    ++s_nPortFrame;
+    const char *pszCapturePath = getenv("FEAR_CAPTURE_PATH");
+    if (pszCapturePath && pszCapturePath[0] && s_nPortFrame == 5)
+        pRenderer->MakeScreenShot(pszCapturePath);
+
+    pRenderer->End3D();
+    pRenderer->FlipScreen();
 }
 
 extern "C" __declspec(dllexport) void FearClient_LogState()

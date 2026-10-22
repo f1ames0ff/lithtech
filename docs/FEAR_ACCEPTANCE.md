@@ -64,12 +64,16 @@ Each gate records:
 
 ## Current baseline
 
-- The menu, v5 client facade, LTAR/asset staging and v113 world preview are implemented.
-- The retail v5 server bootstrap can load Worlds\Release\Intro.World00p.
-- The client is still a preview: there is no real client-server connection, player, HUD or
-  gameplay.
-- The world renderer currently uses flat per-material colors; materials, textures, models,
-  lighting and post-processing are not at parity.
+- The menu, v5 client facade, LTAR/asset staging, v113 world parser and the retail v5 server
+  bootstrap are implemented.
+- The first mission reaches `GS_PLAYING` with a server player object in
+  `Worlds\Release\Intro`.
+- The port camera is now attached to the server player and rendered through `CPlayerCamera`;
+  `CInterfaceMgr` draws the HUD in the same frame.
+- The v113 renderer batches surfaces by material, decodes `.Mat00`/DDS data and uploads 455
+  material textures. Lighting, lightmaps, `.fxo`, models, weapons and shadows are still absent.
+- The local-player character/move-manager path is not initialized, so HUD values and gameplay
+  state remain incomplete.
 
 ## Iteration 8 evidence
 
@@ -80,3 +84,16 @@ Each gate records:
   still the flat v113 preview and the player camera is not yet wired.
 - The visual metric remains unpassed because the current frame does not match
   retail geometry, materials, lighting, HUD or weapon content.
+
+## Iteration 9 evidence
+
+- Camera: the port reaches `GS_PLAYING`, attaches `CPlayerCamera` to the server player target,
+  updates it every frame and renders it through the v5 renderer callback.
+- HUD: the interface manager draws into the same 640x480 frame; health/armor widgets are visible
+  but not yet populated from complete player state.
+- Geometry: 1,979 visible surfaces, 58,355 triangles and 457 used materials are rendered.
+- Materials: 455 DDS textures were decoded and uploaded from the parsed `.Mat00` material table.
+- Capture: the D3D9 back/front buffer is written to a BMP by `ILTRenderer::MakeScreenShot`.
+  `D:\fear-re\tmp\port_materials.bmp` is the current iteration capture.
+- Visual metric: not accepted. The frame is textured and shows HUD, but there is no lightmap,
+  lighting, `.fxo`, model, weapon or shadow parity with retail.

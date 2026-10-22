@@ -19,6 +19,7 @@
 #include "fear_cursor_stub.h"
 #include "fear_filemgr_stub.h"
 #include "fear_resourcemgr_stub.h"
+#include "fear_object_map.h"
 #include "ltobjectcreate.h"
 #include <stdio.h>
 #include <stdarg.h>
@@ -103,6 +104,201 @@ static LTRESULT Stub_GetGameMode_7(int *mode)
 }
 
 bool g_bFearConnected = false;
+
+struct FearMappedObject
+{
+    HOBJECT m_hObject;
+    unsigned short m_nServerId;
+    bool m_bFromServer;
+    float m_Pos[3];
+    float m_Rotation[4];
+};
+
+static FearMappedObject g_FearMappedObjects[4096];
+static int g_nFearMappedObjects = 0;
+static unsigned short g_nFearLocalServerObject = 0xFFFF;
+static HOBJECT g_hFearLocalClientObject = NULL;
+static int g_nFearServerMessageDepth = 0;
+
+static FearMappedObject *FearFindMappedObject(HOBJECT hObject)
+{
+    if (!hObject)
+        return NULL;
+
+    for (int i = 0; i < g_nFearMappedObjects; ++i)
+    {
+        if (g_FearMappedObjects[i].m_hObject == hObject)
+            return &g_FearMappedObjects[i];
+    }
+    return NULL;
+}
+
+static FearMappedObject *FearFindMappedServerObject(unsigned short nServerId)
+{
+    if (nServerId == 0xFFFF)
+        return NULL;
+
+    for (int i = 0; i < g_nFearMappedObjects; ++i)
+    {
+        if (g_FearMappedObjects[i].m_bFromServer && g_FearMappedObjects[i].m_nServerId == nServerId)
+            return &g_FearMappedObjects[i];
+    }
+    return NULL;
+}
+
+static FearMappedObject *FearAllocateMappedObject(HOBJECT hObject, unsigned short nServerId, bool bFromServer)
+{
+    if (!hObject || g_nFearMappedObjects >= 4096)
+        return NULL;
+
+    FearMappedObject *pEntry = &g_FearMappedObjects[g_nFearMappedObjects++];
+    memset(pEntry, 0, sizeof(*pEntry));
+    pEntry->m_hObject = hObject;
+    pEntry->m_nServerId = nServerId;
+    pEntry->m_bFromServer = bFromServer;
+    pEntry->m_Rotation[3] = 1.0f;
+    return pEntry;
+}
+
+extern "C" void FearClient_RegisterObject(HOBJECT hObject)
+{
+    if (!hObject || FearFindMappedObject(hObject))
+        return;
+    FearAllocateMappedObject(hObject, 0xFFFF, false);
+}
+
+extern "C" HOBJECT FearClient_ResolveServerObject(unsigned short nServerId)
+{
+    if (nServerId == 0xFFFF)
+        return NULL;
+
+    FearMappedObject *pEntry = FearFindMappedServerObject(nServerId);
+    if (pEntry)
+        return pEntry->m_hObject;
+
+    const FearEngineApi *pApi = FearHost_GetEngineApi();
+    if (!pApi || !pApi->CreateObject)
+        return NULL;
+
+    FearObjectCreate foc;
+    memset(&foc, 0, sizeof(foc));
+    foc.m_ObjectType = 0;
+    foc.m_Scale = 1.0f;
+    foc.m_Rotation[3] = 1.0f;
+    strncpy(foc.m_Name, "FearServerObject", sizeof(foc.m_Name) - 1);
+
+    HOBJECT hObject = (HOBJECT)pApi->CreateObject(&foc);
+    if (!hObject)
+        return NULL;
+
+    pEntry = FearAllocateMappedObject(hObject, nServerId, true);
+    if (!pEntry)
+        return NULL;
+
+    printf("FEARPORT: mapped server object %u -> %p\n", (unsigned)nServerId, hObject);
+    fflush(stdout);
+    return hObject;
+}
+
+extern "C" void FearClient_SetLocalServerObject(unsigned short nServerId)
+{
+    g_nFearLocalServerObject = nServerId;
+    if (nServerId == 0xFFFF)
+    {
+        g_hFearLocalClientObject = NULL;
+        return;
+    }
+
+    g_hFearLocalClientObject = FearClient_ResolveServerObject(nServerId);
+}
+
+extern "C" void FearClient_BeginServerMessage(void)
+{
+    ++g_nFearServerMessageDepth;
+}
+
+extern "C" void FearClient_EndServerMessage(void)
+{
+    if (g_nFearServerMessageDepth > 0)
+        --g_nFearServerMessageDepth;
+}
+
+extern "C" bool FearClient_IsServerMessage(void)
+{
+    return g_nFearServerMessageDepth > 0;
+}
+
+extern "C" HOBJECT FearClient_GetClientObject(void)
+{
+    return g_hFearLocalClientObject;
+}
+
+extern "C" unsigned short FearClient_GetServerObjectId(HOBJECT hObject)
+{
+    FearMappedObject *pEntry = FearFindMappedObject(hObject);
+    if (!pEntry || !pEntry->m_bFromServer)
+        return 0xFFFF;
+    return pEntry->m_nServerId;
+}
+
+extern "C" void FearClient_UpdateServerObjectTransform(unsigned short nServerId, const float *pPos, const float *pRotation)
+{
+    FearMappedObject *pEntry = FearFindMappedServerObject(nServerId);
+    if (!pEntry)
+        return;
+
+    if (pPos)
+    {
+        pEntry->m_Pos[0] = pPos[0];
+        pEntry->m_Pos[1] = pPos[1];
+        pEntry->m_Pos[2] = pPos[2];
+    }
+
+    if (pRotation)
+    {
+        pEntry->m_Rotation[0] = pRotation[0];
+        pEntry->m_Rotation[1] = pRotation[1];
+        pEntry->m_Rotation[2] = pRotation[2];
+        pEntry->m_Rotation[3] = pRotation[3];
+    }
+}
+
+extern "C" bool FearClient_GetObjectTransform(HOBJECT hObject, float *pPos, float *pRotation)
+{
+    FearMappedObject *pEntry = FearFindMappedObject(hObject);
+    if (!pEntry)
+        return false;
+
+    if (pPos)
+    {
+        pPos[0] = pEntry->m_Pos[0];
+        pPos[1] = pEntry->m_Pos[1];
+        pPos[2] = pEntry->m_Pos[2];
+    }
+
+    if (pRotation)
+    {
+        pRotation[0] = pEntry->m_Rotation[0];
+        pRotation[1] = pEntry->m_Rotation[1];
+        pRotation[2] = pEntry->m_Rotation[2];
+        pRotation[3] = pEntry->m_Rotation[3];
+    }
+
+    return true;
+}
+
+extern "C" void FearClient_RemoveObject(HOBJECT hObject)
+{
+    FearMappedObject *pEntry = FearFindMappedObject(hObject);
+    if (!pEntry)
+        return;
+
+    *pEntry = g_FearMappedObjects[g_nFearMappedObjects - 1];
+    --g_nFearMappedObjects;
+
+    if (g_hFearLocalClientObject == hObject)
+        g_hFearLocalClientObject = NULL;
+}
 
 static LTRESULT Stub_StartGame_8(StartGameRequest *pRequest)
 {
@@ -268,6 +464,7 @@ static HLOCALOBJ Stub_CreateObject_17(ObjectCreateStruct *pStruct)
         foc.m_ObjectType = 0;
         hObject = pApi->CreateObject(&foc);
     }
+    FearClient_RegisterObject(static_cast<HOBJECT>(hObject));
     printf("FHOST CreateObject type=%u -> %p\n", (unsigned)pStruct->m_ObjectType, hObject);
     fflush(stdout);
     return static_cast<HLOCALOBJ>(hObject);
@@ -470,50 +667,104 @@ HOBJECT CFearClient::GetMainWorldModel()
 
 LTRESULT CFearClient::GetObjectRotation(HLOCALOBJ hObj, LTRotation *pRotation)
 {
-    printf("STUB ILTClient::GetObjectRotation\n");
-    return StubDefault<LTRESULT>::Get();
+    if (!pRotation)
+        return LT_INVALIDPARAMS;
+
+    float rotation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    if (!FearClient_GetObjectTransform(hObj, NULL, rotation))
+        return LT_NOTFOUND;
+
+    for (int i = 0; i < 4; ++i)
+        pRotation->m_Quat[i] = rotation[i];
+    return LT_OK;
 }
 
 LTRESULT CFearClient::SetObjectRotation(HOBJECT hObj, const LTRotation& rRotation)
 {
-    printf("STUB ILTClient::SetObjectRotation\n");
-    return StubDefault<LTRESULT>::Get();
+    FearMappedObject *pEntry = FearFindMappedObject(hObj);
+    if (!pEntry)
+        return LT_NOTFOUND;
+
+    for (int i = 0; i < 4; ++i)
+        pEntry->m_Rotation[i] = rRotation.m_Quat[i];
+    return LT_OK;
 }
 
 LTRESULT CFearClient::GetObjectPos(HLOCALOBJ hObj, LTVector *pPos)
 {
-    printf("STUB ILTClient::GetObjectPos\n");
-    return StubDefault<LTRESULT>::Get();
+    if (!pPos)
+        return LT_INVALIDPARAMS;
+
+    float position[3] = {0.0f, 0.0f, 0.0f};
+    if (!FearClient_GetObjectTransform(hObj, position, NULL))
+        return LT_NOTFOUND;
+
+    pPos->Init(position[0], position[1], position[2]);
+    return LT_OK;
 }
 
 LTRESULT CFearClient::SetObjectPos(HLOCALOBJ hObj, const LTVector& vPos)
 {
-    printf("STUB ILTClient::SetObjectPos\n");
-    return StubDefault<LTRESULT>::Get();
+    FearMappedObject *pEntry = FearFindMappedObject(hObj);
+    if (!pEntry)
+        return LT_NOTFOUND;
+
+    pEntry->m_Pos[0] = vPos.x;
+    pEntry->m_Pos[1] = vPos.y;
+    pEntry->m_Pos[2] = vPos.z;
+    return LT_OK;
 }
 
 LTRESULT CFearClient::ForceCurrentObjectPos(HLOCALOBJ hObj)
 {
-    printf("STUB ILTClient::ForceCurrentObjectPos\n");
-    return StubDefault<LTRESULT>::Get();
+    FearMappedObject *pEntry = FearFindMappedObject(hObj);
+    return pEntry ? LT_OK : LT_NOTFOUND;
 }
 
 LTRESULT CFearClient::GetObjectTransform(HLOCALOBJ hObj, LTRigidTransform *pTransform)
 {
-    printf("STUB ILTClient::GetObjectTransform\n");
-    return StubDefault<LTRESULT>::Get();
+    if (!pTransform)
+        return LT_INVALIDPARAMS;
+
+    float position[3] = {0.0f, 0.0f, 0.0f};
+    float rotation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    if (!FearClient_GetObjectTransform(hObj, position, rotation))
+        return LT_NOTFOUND;
+
+    pTransform->m_vPos.Init(position[0], position[1], position[2]);
+    for (int i = 0; i < 4; ++i)
+        pTransform->m_rRot.m_Quat[i] = rotation[i];
+    return LT_OK;
 }
 
 LTRESULT CFearClient::SetObjectTransform(HLOCALOBJ hObj, const LTRigidTransform& tTransform)
 {
-    printf("STUB ILTClient::SetObjectTransform\n");
-    return StubDefault<LTRESULT>::Get();
+    FearMappedObject *pEntry = FearFindMappedObject(hObj);
+    if (!pEntry)
+        return LT_NOTFOUND;
+
+    pEntry->m_Pos[0] = tTransform.m_vPos.x;
+    pEntry->m_Pos[1] = tTransform.m_vPos.y;
+    pEntry->m_Pos[2] = tTransform.m_vPos.z;
+    for (int i = 0; i < 4; ++i)
+        pEntry->m_Rotation[i] = tTransform.m_rRot.m_Quat[i];
+    return LT_OK;
 }
 
 LTRESULT CFearClient::GetObjectTransform(HLOCALOBJ hObj, LTTransform *pTransform)
 {
-    printf("STUB ILTClient::GetObjectTransform\n");
-    return StubDefault<LTRESULT>::Get();
+    if (!pTransform)
+        return LT_INVALIDPARAMS;
+
+    float position[3] = {0.0f, 0.0f, 0.0f};
+    float rotation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+    if (!FearClient_GetObjectTransform(hObj, position, rotation))
+        return LT_NOTFOUND;
+
+    pTransform->m_vPos.Init(position[0], position[1], position[2]);
+    for (int i = 0; i < 4; ++i)
+        pTransform->m_rRot.m_Quat[i] = rotation[i];
+    return LT_OK;
 }
 
 ILTResourceMgr* CFearClient::ResourceMgr()
@@ -564,8 +815,16 @@ ILTLoadingProgress * CFearClient::LoadingProgress()
 
 LTRESULT CFearClient::SetObjectTransform(HLOCALOBJ hObj, const LTTransform& tTransform)
 {
-    printf("STUB ILTClient::SetObjectTransform\n");
-    return StubDefault<LTRESULT>::Get();
+    FearMappedObject *pEntry = FearFindMappedObject(hObj);
+    if (!pEntry)
+        return LT_NOTFOUND;
+
+    pEntry->m_Pos[0] = tTransform.m_vPos.x;
+    pEntry->m_Pos[1] = tTransform.m_vPos.y;
+    pEntry->m_Pos[2] = tTransform.m_vPos.z;
+    for (int i = 0; i < 4; ++i)
+        pEntry->m_Rotation[i] = tTransform.m_rRot.m_Quat[i];
+    return LT_OK;
 }
 
 LTRESULT CFearClient::GetObjectScale(HOBJECT hObj, float* pScale)
@@ -963,8 +1222,8 @@ LTRESULT CFearClient::GetSourceWorldOffset(LTVector& vVector)
 
 LTRESULT CFearClient::RemoveObject(HOBJECT hObj)
 {
-    printf("STUB ILTClient::RemoveObject\n");
-    return StubDefault<LTRESULT>::Get();
+    FearClient_RemoveObject(hObj);
+    return LT_OK;
 }
 
 LTRESULT CFearClient::GetSectorID(const char *pName, uint32 *pResult) const

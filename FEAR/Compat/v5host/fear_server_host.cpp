@@ -547,3 +547,34 @@ void *FearServerHost_GetPlayerObject(void)
 {
     return g_hServerPlayer;
 }
+
+unsigned short FearServerHost_GetPlayerObjectId(void)
+{
+    if (!g_hServerPlayer)
+        return 0xFFFF;
+    return *(unsigned short *)((unsigned char *)g_hServerPlayer + 0x54);
+}
+
+bool FearServerHost_GetPlayerTransform(float *pPos, float *pRotation)
+{
+    if (!g_hServerPlayer || !g_hEngineServer)
+        return false;
+
+    if (pPos)
+    {
+        typedef int(__stdcall *TGetObjectPos)(void *, float *);
+        TGetObjectPos pfnGetPos = (TGetObjectPos)((unsigned char *)g_hEngineServer + 0x4A780);
+        if (pfnGetPos(g_hServerPlayer, pPos) != 0)
+            return false;
+    }
+
+    if (pRotation)
+    {
+        typedef int(__stdcall *TGetObjectRotation)(void *, float *);
+        TGetObjectRotation pfnGetRotation = (TGetObjectRotation)((unsigned char *)g_hEngineServer + 0x4A7F0);
+        if (pfnGetRotation(g_hServerPlayer, pRotation) != 0)
+            return false;
+    }
+
+    return true;
+}

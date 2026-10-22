@@ -11,6 +11,7 @@
 #include "iltclient.h"
 #include "iltmessage.h"
 #include "fear_client_facade.h"
+#include "fear_object_map.h"
 #include "fear_server_host.h"
 #include "fear_resourcemgr_stub.h"
 #include "fear_common_stub.h"
@@ -70,6 +71,9 @@ typedef void (*TFearClientReplySaveFailed)();
 typedef void (*TFearClientEnterWorldPreview)();
 typedef void (*TFearClientRenderWorldPreview)();
 typedef int (*TFearClientStartNewGame)();
+typedef int (*TFearClientIsPlaying)();
+typedef int (*TFearClientPreparePortPlayer)(void *);
+typedef void (*TFearClientRenderPortCamera)();
 
 static TFearClientMouseMove g_pfnClientMouseMove = NULL;
 static TFearClientMouseButton g_pfnClientMouseButton = NULL;
@@ -84,6 +88,9 @@ static TFearClientReplySaveFailed g_pfnClientReplySaveFailed = NULL;
 static TFearClientEnterWorldPreview g_pfnClientEnterWorldPreview = NULL;
 static TFearClientRenderWorldPreview g_pfnClientRenderWorldPreview = NULL;
 static TFearClientStartNewGame g_pfnClientStartNewGame = NULL;
+static TFearClientIsPlaying g_pfnClientIsPlaying = NULL;
+static TFearClientPreparePortPlayer g_pfnClientPreparePortPlayer = NULL;
+static TFearClientRenderPortCamera g_pfnClientRenderPortCamera = NULL;
 
 static bool g_bWorldPreview = false;
 static bool g_bAwaitPostload = false;
@@ -122,8 +129,8 @@ extern "C" void FearHost_DeliverServerMessage(ILTMessage_Read *pMessage)
         return;
     }
     if (nMessageID == 103 || nMessageID == 126 || nMessageID == 129 || nMessageID == 145 ||
-        nMessageID == 212 || nMessageID == 231 || nMessageID == 229 ||
-        nMessageID == 233 || nMessageID == 230 || nMessageID == 138)
+        nMessageID == 212 || nMessageID == 229 || nMessageID == 233 || nMessageID == 138 ||
+        nMessageID == 230 || nMessageID == 231)
     {
         printf(" skipped\n");
         fflush(stdout);
@@ -153,7 +160,13 @@ extern "C" void FearHost_DeliverServerMessage(ILTMessage_Read *pMessage)
         pMessage->SeekTo(nSaved);
     }
 
+    unsigned short nPlayerObjectId = FearServerHost_GetPlayerObjectId();
+    if (nPlayerObjectId != 0xFFFF)
+        FearClient_SetLocalServerObject(nPlayerObjectId);
+
+    FearClient_BeginServerMessage();
     g_pShell->OnMessage(pMessage);
+    FearClient_EndServerMessage();
 
     static bool s_bWorldLoadTriggered = false;
     if (!s_bWorldLoadTriggered && (nMessageID == 186 || nMessageID == 195) && g_pfnClientPreLoadWorld)
@@ -197,6 +210,9 @@ extern "C" __declspec(dllexport) int FearHost_Init(const char *pszGameClientDll,
     g_pfnClientEnterWorldPreview = (TFearClientEnterWorldPreview)GetProcAddress(g_hGameClient, "FearClient_EnterWorldPreview");
     g_pfnClientRenderWorldPreview = (TFearClientRenderWorldPreview)GetProcAddress(g_hGameClient, "FearClient_RenderWorldPreview");
     g_pfnClientStartNewGame = (TFearClientStartNewGame)GetProcAddress(g_hGameClient, "FearClient_StartNewGame");
+    g_pfnClientIsPlaying = (TFearClientIsPlaying)GetProcAddress(g_hGameClient, "FearClient_IsPlaying");
+    g_pfnClientPreparePortPlayer = (TFearClientPreparePortPlayer)GetProcAddress(g_hGameClient, "FearClient_PreparePortPlayer");
+    g_pfnClientRenderPortCamera = (TFearClientRenderPortCamera)GetProcAddress(g_hGameClient, "FearClient_RenderPortCamera");
     FearServerHost_SetMessageSink(FearHost_DeliverServerMessage);
     char szRetailAbi[16] = {0};
     DWORD nRetailAbi = GetEnvironmentVariableA("FEAR_RETAIL_ABI", szRetailAbi, sizeof(szRetailAbi));
@@ -235,6 +251,16 @@ extern "C" __declspec(dllexport) void FearHost_Update(void)
     if (FearServerHost_IsRunning())
         FearServerHost_Update();
 
+    unsigned short nPlayerObjectId = FearServerHost_GetPlayerObjectId();
+    if (nPlayerObjectId != 0xFFFF)
+    {
+        float position[3] = {0.0f, 0.0f, 0.0f};
+        float rotation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        FearClient_SetLocalServerObject(nPlayerObjectId);
+        if (FearServerHost_GetPlayerTransform(position, rotation))
+            FearClient_UpdateServerObjectTransform(nPlayerObjectId, position, rotation);
+    }
+
     if (!g_pShell)
         return;
 
@@ -243,6 +269,27 @@ extern "C" __declspec(dllexport) void FearHost_Update(void)
     g_pShell->PreUpdate();
     g_pShell->Update();
     g_pShell->PostUpdate();
+
+    static bool s_bPortCameraReady = false;
+    const bool bClientPlaying = g_pfnClientIsPlaying && g_pfnClientIsPlaying();
+    if (!s_bPortCameraReady && bClientPlaying && g_bFearConnected && FearServerHost_GetPlayerObject() &&
+        g_pfnClientPreparePortPlayer && g_pfnClientRenderPortCamera)
+    {
+        unsigned short nObjectId = FearServerHost_GetPlayerObjectId();
+        if (nObjectId == 0xFFFF)
+            nObjectId = 0;
+
+        HOBJECT hTarget = FearClient_ResolveServerObject(nObjectId);
+        if (hTarget && g_pfnClientPreparePortPlayer(hTarget))
+        {
+            s_bPortCameraReady = true;
+            printf("FEARPORT: port camera ready target=%p id=%u\n", hTarget, (unsigned)nObjectId);
+            fflush(stdout);
+        }
+    }
+
+    if (s_bPortCameraReady && bClientPlaying && g_pfnClientRenderPortCamera)
+        g_pfnClientRenderPortCamera();
 
     if (g_bAwaitPostload && g_pfnClientIsPostload && g_pfnClientIsPostload() && g_pfnClientPressKey)
     {

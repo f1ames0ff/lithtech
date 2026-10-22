@@ -752,6 +752,133 @@ static int FearRender_Present(void)
     return (g_pFearClient->FlipScreen(0) == LT_OK) ? 1 : 0;
 }
 
+static int FearRender_MakeScreenShot(const char *pszFilename)
+{
+    if (!g_pFearClient || !pszFilename || !pszFilename[0])
+        return 0;
+
+    void *pDeviceValue = NULL;
+    if (g_pFearClient->GetEngineHook("d3ddevice", &pDeviceValue) != LT_OK || !pDeviceValue)
+    {
+        printf("FEARRENDER: screenshot failed device\n");
+        fflush(stdout);
+        return 0;
+    }
+
+    IDirect3DDevice9 *pDevice = (IDirect3DDevice9 *)pDeviceValue;
+    IDirect3DSurface9 *pBackBuffer = NULL;
+    IDirect3DSurface9 *pOffscreen = NULL;
+    if (FAILED(pDevice->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &pBackBuffer)) || !pBackBuffer)
+    {
+        printf("FEARRENDER: screenshot failed backbuffer\n");
+        fflush(stdout);
+        return 0;
+    }
+
+    D3DSURFACE_DESC desc;
+    memset(&desc, 0, sizeof(desc));
+    if (FAILED(pBackBuffer->GetDesc(&desc)) ||
+        FAILED(pDevice->CreateOffscreenPlainSurface(desc.Width, desc.Height, D3DFMT_A8R8G8B8,
+            D3DPOOL_SYSTEMMEM, &pOffscreen, NULL)) ||
+        !pOffscreen)
+    {
+        printf("FEARRENDER: screenshot failed surface\n");
+        fflush(stdout);
+        pBackBuffer->Release();
+        return 0;
+    }
+
+    if (FAILED(pDevice->GetRenderTargetData(pBackBuffer, pOffscreen)) &&
+        FAILED(pDevice->GetFrontBufferData(0, pOffscreen)))
+    {
+        printf("FEARRENDER: screenshot failed readback\n");
+        fflush(stdout);
+        pOffscreen->Release();
+        pBackBuffer->Release();
+        return 0;
+    }
+
+    D3DLOCKED_RECT locked;
+    memset(&locked, 0, sizeof(locked));
+    if (FAILED(pOffscreen->LockRect(&locked, NULL, D3DLOCK_READONLY)))
+    {
+        pOffscreen->Release();
+        pBackBuffer->Release();
+        return 0;
+    }
+
+    const unsigned int nWidth = desc.Width;
+    const unsigned int nHeight = desc.Height;
+    const unsigned int nImageBytes = nWidth * nHeight * 4;
+    unsigned char *pPixels = new (std::nothrow) unsigned char[nImageBytes];
+    if (!pPixels)
+    {
+        pOffscreen->UnlockRect();
+        pOffscreen->Release();
+        pBackBuffer->Release();
+        return 0;
+    }
+
+    for (unsigned int y = 0; y < nHeight; ++y)
+    {
+        const unsigned char *pSource = (const unsigned char *)locked.pBits + (nHeight - 1 - y) * locked.Pitch;
+        unsigned char *pDest = pPixels + y * nWidth * 4;
+        for (unsigned int x = 0; x < nWidth; ++x)
+        {
+            pDest[x * 4 + 0] = pSource[x * 4 + 0];
+            pDest[x * 4 + 1] = pSource[x * 4 + 1];
+            pDest[x * 4 + 2] = pSource[x * 4 + 2];
+            pDest[x * 4 + 3] = 255;
+        }
+    }
+
+    pOffscreen->UnlockRect();
+    pOffscreen->Release();
+    pBackBuffer->Release();
+
+    FILE *pFile = fopen(pszFilename, "wb");
+    if (!pFile)
+    {
+        delete [] pPixels;
+        return 0;
+    }
+
+    unsigned char header[54];
+    memset(header, 0, sizeof(header));
+    header[0] = 'B';
+    header[1] = 'M';
+    const unsigned int nFileSize = 54 + nImageBytes;
+    header[2] = (unsigned char)(nFileSize);
+    header[3] = (unsigned char)(nFileSize >> 8);
+    header[4] = (unsigned char)(nFileSize >> 16);
+    header[5] = (unsigned char)(nFileSize >> 24);
+    header[10] = 54;
+    header[14] = 40;
+    header[18] = (unsigned char)(nWidth);
+    header[19] = (unsigned char)(nWidth >> 8);
+    header[20] = (unsigned char)(nWidth >> 16);
+    header[21] = (unsigned char)(nWidth >> 24);
+    header[22] = (unsigned char)(nHeight);
+    header[23] = (unsigned char)(nHeight >> 8);
+    header[24] = (unsigned char)(nHeight >> 16);
+    header[25] = (unsigned char)(nHeight >> 24);
+    header[26] = 1;
+    header[28] = 32;
+    header[34] = (unsigned char)(nImageBytes);
+    header[35] = (unsigned char)(nImageBytes >> 8);
+    header[36] = (unsigned char)(nImageBytes >> 16);
+    header[37] = (unsigned char)(nImageBytes >> 24);
+
+    fwrite(header, 1, sizeof(header), pFile);
+    fwrite(pPixels, 1, nImageBytes, pFile);
+    fclose(pFile);
+    delete [] pPixels;
+
+    printf("FEARRENDER: screenshot %s %ux%u\n", pszFilename, nWidth, nHeight);
+    fflush(stdout);
+    return 1;
+}
+
 static int FearRender_RenderWorld(void)
 {
     FEAR_LOG_ONCE("RenderWorld");
@@ -842,5 +969,6 @@ extern "C" const FearRenderApi g_FearRenderApi =
     FearRender_RenderTextureString,
     FearRender_CreateTextureFromRGBA,
     FearRender_RenderWorld,
-    FearRender_SetWorldCamera
+    FearRender_SetWorldCamera,
+    FearRender_MakeScreenShot
 };

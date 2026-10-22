@@ -1,5 +1,8 @@
 #include "fear_world.h"
 #include "cshell_filemgr.h"
+#include "fear_host_api.h"
+#include "fear_render_api.h"
+#include "dds_loader.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -11,12 +14,21 @@
 struct FearWorldVertex
 {
     float x, y, z;
-    DWORD color;
+    float u, v;
 };
 
-static std::vector<FearWorldVertex> g_WorldVertices;
-static IDirect3DVertexBuffer9 *g_pWorldVB = NULL;
-static UINT g_nWorldVBVertices = 0;
+struct FearWorldBatch
+{
+    std::string m_Name;
+    std::vector<FearWorldVertex> m_Vertices;
+    IDirect3DVertexBuffer9 *m_pVertexBuffer;
+    unsigned int m_nVertexCount;
+    DWORD m_Color;
+    IDirect3DTexture9 *m_pTexture;
+    bool m_bTextureLoaded;
+};
+
+static std::vector<FearWorldBatch> g_WorldBatches;
 static bool g_bWorldLoaded = false;
 static float g_WorldMin[3] = {0, 0, 0};
 static float g_WorldMax[3] = {0, 0, 0};
@@ -56,6 +68,151 @@ static bool FearIsShadowVolumeMaterial(const std::string &name)
         normalized.push_back(c);
     }
     return normalized == "engine\\shadowvolume.mat00";
+}
+
+static DWORD FearMaterialColor(unsigned int nMaterial)
+{
+    unsigned char colorR = (unsigned char)(64 + ((nMaterial * 37) % 160));
+    unsigned char colorG = (unsigned char)(64 + ((nMaterial * 73) % 160));
+    unsigned char colorB = (unsigned char)(64 + ((nMaterial * 151) % 160));
+    return 0xff000000 | ((DWORD)colorR << 16) | ((DWORD)colorG << 8) | colorB;
+}
+
+static bool FearReadFile(const char *pszFilename, std::vector<unsigned char> &data)
+{
+    void *hFile = FearFile_Open(pszFilename);
+    if (!hFile)
+        return false;
+
+    unsigned long long nSize = FearFile_Size(hFile);
+    if (nSize == 0 || nSize > 64ull * 1024ull * 1024ull)
+    {
+        FearFile_Close(hFile);
+        return false;
+    }
+
+    data.resize((size_t)nSize);
+    if (!FearFile_Read(hFile, data.data(), (unsigned int)nSize))
+    {
+        FearFile_Close(hFile);
+        data.clear();
+        return false;
+    }
+    FearFile_Close(hFile);
+    return true;
+}
+
+static bool FearHasDDSExtension(const char *pszFilename)
+{
+    if (!pszFilename)
+        return false;
+    size_t nLength = strlen(pszFilename);
+    if (nLength < 4)
+        return false;
+    const char *p = pszFilename + nLength - 4;
+    return p[0] == '.' &&
+        (p[1] == 'd' || p[1] == 'D') &&
+        (p[2] == 'd' || p[2] == 'D') &&
+        (p[3] == 's' || p[3] == 'S');
+}
+
+static bool FearReadMaterialTexture(const char *pszMaterial, std::string &textureName)
+{
+    std::vector<unsigned char> data;
+    if (!FearReadFile(pszMaterial, data))
+        return false;
+    if (data.size() < 32 || memcmp(data.data(), "LTMI", 4) != 0)
+        return false;
+
+    size_t o = 8;
+    if (o + 2 > data.size())
+        return false;
+    unsigned int nShaderLength = FearReadU16(data.data() + o);
+    o += 2;
+    if (o + nShaderLength > data.size())
+        return false;
+    o += nShaderLength;
+
+    if (o + 4 > data.size())
+        return false;
+    unsigned int nParams = FearReadU32(data.data() + o);
+    o += 4;
+    if (nParams > 1024)
+        return false;
+
+    for (unsigned int i = 0; i < nParams; ++i)
+    {
+        if (o + 4 > data.size())
+            return false;
+        unsigned int nType = FearReadU32(data.data() + o);
+        o += 4;
+        if (o + 2 > data.size())
+            return false;
+        unsigned int nNameLength = FearReadU16(data.data() + o);
+        o += 2;
+        if (o + nNameLength > data.size())
+            return false;
+        std::string name((const char *)data.data() + o, nNameLength);
+        o += nNameLength;
+
+        if (nType == 1)
+        {
+            if (o + 2 > data.size())
+                return false;
+            unsigned int nValueLength = FearReadU16(data.data() + o);
+            o += 2;
+            if (o + nValueLength > data.size())
+                return false;
+            std::string value((const char *)data.data() + o, nValueLength);
+            o += nValueLength;
+            if (textureName.empty() && FearHasDDSExtension(value.c_str()))
+                textureName = value;
+        }
+        else if (nType == 2)
+            o += 12;
+        else if (nType == 3)
+            o += 16;
+        else if (nType == 4 || nType == 5)
+            o += 4;
+        else
+            return false;
+
+        if (o > data.size())
+            return false;
+    }
+
+    return !textureName.empty();
+}
+
+static bool FearReadVertexUV(const unsigned char *pVertex, unsigned int nVertexSize, float &u, float &v)
+{
+    unsigned int nOffset = 0;
+    switch (nVertexSize)
+    {
+    case 24:
+    case 48:
+    case 84:
+        nOffset = 16;
+        break;
+    case 32:
+    case 36:
+    case 40:
+    case 56:
+        nOffset = 24;
+        break;
+    case 60:
+        nOffset = 28;
+        break;
+    default:
+        return false;
+    }
+
+    if (nOffset + 8 > nVertexSize)
+        return false;
+
+    u = FearReadF32(pVertex + nOffset);
+    v = FearReadF32(pVertex + nOffset + 4);
+    return true;
 }
 
 static bool FearReadWorldFile(const char *pszFilename, std::vector<unsigned char> &data)
@@ -105,11 +262,10 @@ static void FearAddTriangle(const unsigned char *pVertexBlock, unsigned int nVer
         nIds[i] = nLocal;
     }
 
-    unsigned char colorR = (unsigned char)(64 + ((nMaterial * 37) % 160));
-    unsigned char colorG = (unsigned char)(64 + ((nMaterial * 73) % 160));
-    unsigned char colorB = (unsigned char)(64 + ((nMaterial * 151) % 160));
-    DWORD color = 0xff000000 | ((DWORD)colorR << 16) | ((DWORD)colorG << 8) | colorB;
+    if (nMaterial >= g_WorldBatches.size())
+        nMaterial = 0;
 
+    FearWorldBatch &batch = g_WorldBatches[nMaterial];
     for (int i = 0; i < 3; ++i)
     {
         size_t nOffset = (size_t)nVertexStart * nVertexSize + (size_t)nIds[i] * nVertexSize;
@@ -119,8 +275,10 @@ static void FearAddTriangle(const unsigned char *pVertexBlock, unsigned int nVer
         v.x = FearReadF32(pVertexBlock + nOffset);
         v.y = FearReadF32(pVertexBlock + nOffset + 4);
         v.z = FearReadF32(pVertexBlock + nOffset + 8);
-        v.color = color;
-        g_WorldVertices.push_back(v);
+        v.u = 0.0f;
+        v.v = 0.0f;
+        FearReadVertexUV(pVertexBlock + nOffset, nVertexSize, v.u, v.v);
+        batch.m_Vertices.push_back(v);
     }
 }
 
@@ -209,6 +367,19 @@ int FearWorld_Load(const char *pszFilename)
         nMaterialOffset += nLength;
     }
 
+    g_WorldBatches.clear();
+    g_WorldBatches.resize(materialNames.size());
+    for (size_t i = 0; i < g_WorldBatches.size(); ++i)
+    {
+        FearWorldBatch &batch = g_WorldBatches[i];
+        batch.m_Name = materialNames[i];
+        batch.m_pVertexBuffer = NULL;
+        batch.m_nVertexCount = 0;
+        batch.m_Color = FearMaterialColor((unsigned int)i);
+        batch.m_pTexture = NULL;
+        batch.m_bTextureLoaded = false;
+    }
+
     unsigned int nVisibleSurfaces = 0;
     unsigned int nSkippedSurfaces = 0;
     for (unsigned int i = 0; i < nSurfaces; ++i)
@@ -247,28 +418,38 @@ int FearWorld_Load(const char *pszFilename)
         }
     }
 
-    if (g_WorldVertices.empty())
+    unsigned int nVertexCount = 0;
+    unsigned int nUsedMaterials = 0;
+    g_WorldMin[0] = g_WorldMin[1] = g_WorldMin[2] = 1.0e30f;
+    g_WorldMax[0] = g_WorldMax[1] = g_WorldMax[2] = -1.0e30f;
+    for (size_t i = 0; i < g_WorldBatches.size(); ++i)
+    {
+        FearWorldBatch &batch = g_WorldBatches[i];
+        if (batch.m_Vertices.empty())
+            continue;
+        ++nUsedMaterials;
+        nVertexCount += (unsigned int)batch.m_Vertices.size();
+        for (size_t j = 0; j < batch.m_Vertices.size(); ++j)
+        {
+            const FearWorldVertex &v = batch.m_Vertices[j];
+            if (v.x < g_WorldMin[0]) g_WorldMin[0] = v.x;
+            if (v.y < g_WorldMin[1]) g_WorldMin[1] = v.y;
+            if (v.z < g_WorldMin[2]) g_WorldMin[2] = v.z;
+            if (v.x > g_WorldMax[0]) g_WorldMax[0] = v.x;
+            if (v.y > g_WorldMax[1]) g_WorldMax[1] = v.y;
+            if (v.z > g_WorldMax[2]) g_WorldMax[2] = v.z;
+        }
+    }
+
+    if (nVertexCount == 0)
     {
         printf("FEARWORLD: no triangles parsed\n");
         return 0;
     }
 
-    g_WorldMin[0] = g_WorldMin[1] = g_WorldMin[2] = 1.0e30f;
-    g_WorldMax[0] = g_WorldMax[1] = g_WorldMax[2] = -1.0e30f;
-    for (size_t i = 0; i < g_WorldVertices.size(); ++i)
-    {
-        const FearWorldVertex &v = g_WorldVertices[i];
-        if (v.x < g_WorldMin[0]) g_WorldMin[0] = v.x;
-        if (v.y < g_WorldMin[1]) g_WorldMin[1] = v.y;
-        if (v.z < g_WorldMin[2]) g_WorldMin[2] = v.z;
-        if (v.x > g_WorldMax[0]) g_WorldMax[0] = v.x;
-        if (v.y > g_WorldMax[1]) g_WorldMax[1] = v.y;
-        if (v.z > g_WorldMax[2]) g_WorldMax[2] = v.z;
-    }
-
-    printf("FEARWORLD: surfaces=%u visible_surfaces=%u skipped_shadow_surfaces=%u materials=%u vertices=%u triangles=%u bounds=(%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f)\n",
-        nSurfaceCount, nVisibleSurfaces, nSkippedSurfaces, nMaterialCount,
-        (unsigned)g_WorldVertices.size(), (unsigned)(g_WorldVertices.size() / 3),
+    printf("FEARWORLD: surfaces=%u visible_surfaces=%u skipped_shadow_surfaces=%u materials=%u used_materials=%u vertices=%u triangles=%u bounds=(%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f)\n",
+        nSurfaceCount, nVisibleSurfaces, nSkippedSurfaces, nMaterialCount, nUsedMaterials,
+        nVertexCount, nVertexCount / 3,
         g_WorldMin[0], g_WorldMin[1], g_WorldMin[2], g_WorldMax[0], g_WorldMax[1], g_WorldMax[2]);
     fflush(stdout);
     return 1;
@@ -326,29 +507,118 @@ static FearMatrix FearPerspective(float fFovY, float fAspect, float fNear, float
     return r;
 }
 
+static IDirect3DTexture9 *FearWorldLoadDDS(IDirect3DDevice9 *pDevice, const char *pszFilename)
+{
+    if (!pDevice || !pszFilename || !pszFilename[0])
+        return NULL;
+
+    std::vector<unsigned char> data;
+    if (!FearReadFile(pszFilename, data))
+        return NULL;
+
+    FearDDSImage image = {0, 0, NULL};
+    if (!FearDDS_Load(data.data(), (unsigned int)data.size(), image))
+        return NULL;
+    if (image.m_Width == 0 || image.m_Height == 0)
+    {
+        FearDDS_Free(image);
+        return NULL;
+    }
+
+    IDirect3DTexture9 *pTexture = NULL;
+    if (FAILED(pDevice->CreateTexture(image.m_Width, image.m_Height, 1, 0,
+        D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &pTexture, NULL)))
+    {
+        FearDDS_Free(image);
+        return NULL;
+    }
+
+    D3DLOCKED_RECT locked;
+    memset(&locked, 0, sizeof(locked));
+    if (FAILED(pTexture->LockRect(0, &locked, NULL, 0)))
+    {
+        pTexture->Release();
+        FearDDS_Free(image);
+        return NULL;
+    }
+
+    for (unsigned int y = 0; y < image.m_Height; ++y)
+    {
+        unsigned char *pDest = (unsigned char *)locked.pBits + (size_t)y * locked.Pitch;
+        const unsigned char *pSource = image.m_pPixels + (size_t)y * image.m_Width * 4;
+        for (unsigned int x = 0; x < image.m_Width; ++x)
+        {
+            pDest[x * 4 + 0] = pSource[x * 4 + 2];
+            pDest[x * 4 + 1] = pSource[x * 4 + 1];
+            pDest[x * 4 + 2] = pSource[x * 4 + 0];
+            pDest[x * 4 + 3] = pSource[x * 4 + 3];
+        }
+    }
+
+    pTexture->UnlockRect(0);
+    FearDDS_Free(image);
+    return pTexture;
+}
+
+static void FearWorldLoadTextures(IDirect3DDevice9 *pDevice)
+{
+    unsigned int nLoaded = 0;
+    for (size_t i = 0; i < g_WorldBatches.size(); ++i)
+    {
+        FearWorldBatch &batch = g_WorldBatches[i];
+        if (batch.m_Vertices.empty() || batch.m_bTextureLoaded)
+            continue;
+
+        batch.m_bTextureLoaded = true;
+        std::string textureName;
+        if (!FearReadMaterialTexture(batch.m_Name.c_str(), textureName))
+            continue;
+
+        batch.m_pTexture = FearWorldLoadDDS(pDevice, textureName.c_str());
+        if (batch.m_pTexture)
+            ++nLoaded;
+    }
+
+    printf("FEARWORLD: loaded %u material textures\n", nLoaded);
+    fflush(stdout);
+}
+
+static bool FearWorldCreateBatchBuffer(IDirect3DDevice9 *pDevice, FearWorldBatch &batch)
+{
+    if (batch.m_Vertices.empty())
+        return false;
+    if (batch.m_pVertexBuffer)
+        return true;
+
+    if (FAILED(pDevice->CreateVertexBuffer((UINT)(batch.m_Vertices.size() * sizeof(FearWorldVertex)),
+        D3DUSAGE_WRITEONLY, D3DFVF_XYZ | D3DFVF_TEX1, D3DPOOL_MANAGED, &batch.m_pVertexBuffer, NULL)))
+    {
+        return false;
+    }
+
+    void *pData = NULL;
+    if (FAILED(batch.m_pVertexBuffer->Lock(0, 0, &pData, 0)))
+        return false;
+    memcpy(pData, batch.m_Vertices.data(), batch.m_Vertices.size() * sizeof(FearWorldVertex));
+    batch.m_pVertexBuffer->Unlock();
+    batch.m_nVertexCount = (unsigned int)batch.m_Vertices.size();
+    return true;
+}
+
 void FearWorld_Render(IDirect3DDevice9 *pDevice)
 {
     if (!pDevice)
         return;
     if (!g_bWorldLoaded)
         FearWorld_Load("Worlds\\Release\\Intro.World00p");
-    if (g_WorldVertices.empty())
+    if (g_WorldBatches.empty())
         return;
 
-    if (!g_pWorldVB)
+    static bool s_bTexturesLoaded = false;
+    if (!s_bTexturesLoaded)
     {
-        if (FAILED(pDevice->CreateVertexBuffer((UINT)(g_WorldVertices.size() * sizeof(FearWorldVertex)),
-            D3DUSAGE_WRITEONLY, D3DFVF_XYZ | D3DFVF_DIFFUSE, D3DPOOL_MANAGED, &g_pWorldVB, NULL)))
-        {
-            printf("FEARWORLD: vertex buffer creation failed\n");
-            return;
-        }
-        void *pData = NULL;
-        if (FAILED(g_pWorldVB->Lock(0, 0, &pData, 0)))
-            return;
-        memcpy(pData, g_WorldVertices.data(), g_WorldVertices.size() * sizeof(FearWorldVertex));
-        g_pWorldVB->Unlock();
-        g_nWorldVBVertices = (UINT)g_WorldVertices.size();
+        s_bTexturesLoaded = true;
+        FearWorldLoadTextures(pDevice);
     }
 
     float eye[3] = { g_CameraPos[0], g_CameraPos[1], g_CameraPos[2] };
@@ -363,19 +633,34 @@ void FearWorld_Render(IDirect3DDevice9 *pDevice)
     pDevice->Clear(0, NULL, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff101018, 1.0f, 0);
     pDevice->SetVertexShader(NULL);
     pDevice->SetPixelShader(NULL);
-    pDevice->SetFVF(D3DFVF_XYZ | D3DFVF_DIFFUSE);
+    pDevice->SetFVF(D3DFVF_XYZ | D3DFVF_TEX1);
     pDevice->SetRenderState(D3DRS_LIGHTING, FALSE);
     pDevice->SetRenderState(D3DRS_ZENABLE, TRUE);
     pDevice->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
-    pDevice->SetTexture(0, NULL);
+    pDevice->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+    pDevice->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
+    pDevice->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_TFACTOR);
+    pDevice->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+    pDevice->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+    pDevice->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    pDevice->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
 
     FearMatrix view = FearLookAt(eye, target, up);
     FearMatrix proj = FearPerspective(1.2f, 640.0f / 480.0f, 1.0f, 200000.0f);
     pDevice->SetTransform(D3DTS_VIEW, (const D3DMATRIX *)&view);
     pDevice->SetTransform(D3DTS_PROJECTION, (const D3DMATRIX *)&proj);
 
-    pDevice->SetStreamSource(0, g_pWorldVB, 0, sizeof(FearWorldVertex));
-    pDevice->DrawPrimitive(D3DPT_TRIANGLELIST, 0, g_nWorldVBVertices / 3);
+    for (size_t i = 0; i < g_WorldBatches.size(); ++i)
+    {
+        FearWorldBatch &batch = g_WorldBatches[i];
+        if (!FearWorldCreateBatchBuffer(pDevice, batch))
+            continue;
+
+        pDevice->SetRenderState(D3DRS_TEXTUREFACTOR, batch.m_pTexture ? 0xffffffff : batch.m_Color);
+        pDevice->SetTexture(0, batch.m_pTexture);
+        pDevice->SetStreamSource(0, batch.m_pVertexBuffer, 0, sizeof(FearWorldVertex));
+        pDevice->DrawPrimitive(D3DPT_TRIANGLELIST, 0, batch.m_nVertexCount / 3);
+    }
 }
 
 void FearWorld_SetCamera(const float *pPos, float fYaw, float fPitch)
@@ -396,11 +681,21 @@ void FearWorld_SetCamera(const float *pPos, float fYaw, float fPitch)
 
 void FearWorld_Shutdown()
 {
-    if (g_pWorldVB)
+    for (size_t i = 0; i < g_WorldBatches.size(); ++i)
     {
-        g_pWorldVB->Release();
-        g_pWorldVB = NULL;
+        FearWorldBatch &batch = g_WorldBatches[i];
+        if (batch.m_pVertexBuffer)
+        {
+            batch.m_pVertexBuffer->Release();
+            batch.m_pVertexBuffer = NULL;
+        }
+        if (batch.m_pTexture)
+        {
+            batch.m_pTexture->Release();
+            batch.m_pTexture = NULL;
+        }
+        batch.m_Vertices.clear();
     }
-    g_WorldVertices.clear();
+    g_WorldBatches.clear();
     g_bWorldLoaded = false;
 }

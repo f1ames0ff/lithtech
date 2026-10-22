@@ -1,4 +1,5 @@
 #include "fear_messageread_stub.h"
+#include "fear_object_map.h"
 #include <string.h>
 #include <wchar.h>
 
@@ -226,7 +227,11 @@ LTRotation CFearMessageRead::ReadCompLTRotation()
 HOBJECT CFearMessageRead::ReadObject()
 {
     uint32 nID = ReadBits(16);
-    return (nID == 0xFFFF) ? NULL : (HOBJECT)(uintptr_t)nID;
+    if (nID == 0xFFFF)
+        return NULL;
+    if (FearClient_IsServerMessage())
+        return FearClient_ResolveServerObject((unsigned short)nID);
+    return (HOBJECT)(uintptr_t)nID;
 }
 
 LTRotation CFearMessageRead::ReadYRotation()

@@ -15,6 +15,8 @@ void FearServerHost_Shutdown(void);
 bool FearServerHost_IsRunning(void);
 void *FearServerHost_GetClientHandle(void);
 void *FearServerHost_GetPlayerObject(void);
+unsigned short FearServerHost_GetPlayerObjectId(void);
+bool FearServerHost_GetPlayerTransform(float *pPos, float *pRotation);
 
 typedef void (*TFearServerMessageSink)(ILTMessage_Read *pMessage);
 void FearServerHost_SetMessageSink(TFearServerMessageSink pSink);

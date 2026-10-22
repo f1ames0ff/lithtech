@@ -274,7 +274,10 @@ static LONG CALLBACK FearCrashHandler(EXCEPTION_POINTERS *pExceptionInfo)
         nReturn = *reinterpret_cast<ULONG_PTR *>(pExceptionInfo->ContextRecord->Esp);
     char szReturnModule[MAX_PATH] = {0};
     FearGetModuleName(nReturn, szReturnModule, sizeof(szReturnModule));
-    printf("CRASH return=%p module=%s\n", reinterpret_cast<void *>(nReturn), szReturnModule);
+    HMODULE hReturnModule = szReturnModule[0] ? GetModuleHandleA(szReturnModule) : NULL;
+    printf("CRASH return=%p module=%s base=%p rva=%p\n", reinterpret_cast<void *>(nReturn), szReturnModule,
+           reinterpret_cast<void *>(hReturnModule),
+           reinterpret_cast<void *>(hReturnModule ? (nReturn - reinterpret_cast<ULONG_PTR>(hReturnModule)) : 0));
     {
         CONTEXT *pCtx = pExceptionInfo->ContextRecord;
         unsigned long nSlot54 = 0;

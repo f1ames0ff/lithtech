@@ -32,6 +32,7 @@ struct FearRenderApi
     void *(*CreateTextureFromRGBA)(const unsigned int *pPixels, int nWidth, int nHeight);
     int   (*RenderWorld)(void);
     void  (*SetWorldCamera)(const float *pPos, float fYaw, float fPitch);
+    int   (*MakeScreenShot)(const char *pszFilename);
 };
 
 typedef struct FearRenderApi FearRenderApi;

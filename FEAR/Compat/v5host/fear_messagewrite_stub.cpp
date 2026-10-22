@@ -1,5 +1,6 @@
 #include "fear_messagewrite_stub.h"
 #include "fear_messageread_stub.h"
+#include "fear_object_map.h"
 #include <string.h>
 #include <wchar.h>
 
@@ -152,7 +153,8 @@ void CFearMessageWrite::WriteCompLTRotation(const LTRotation &cRotation)
 
 void CFearMessageWrite::WriteObject(HOBJECT hObj)
 {
-    WriteBits(hObj ? 0 : 0xFFFF, 16);
+    unsigned short nServerId = FearClient_GetServerObjectId(hObj);
+    WriteBits(nServerId, 16);
 }
 
 void CFearMessageWrite::WriteYRotation(const LTRotation &cRotation)

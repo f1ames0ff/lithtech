@@ -871,3 +871,54 @@ Remaining blockers for the stated goal:
   chains, lights and shadows are still the next renderer milestone.
 - The `IsMultiplayerExe` and internal EngineServer offsets remain a retail
   bootstrap dependency until the source-side server is implemented.
+
+### Iteration 9 - player camera, textured world and HUD bridge
+
+The first mission now renders from the server player camera instead of the
+fixed preview camera.
+
+- The server host exposes the engine player object's position, rotation and
+  object id through the recovered `sub_1004A780` / `sub_1004A7F0` accessors.
+- The host maintains a small client object registry: server object ids are
+  resolved to engine object handles, transforms are stored in the registry,
+  and `ILTClient` transform getters/setters operate on those records. Locally
+  created camera and effect objects are registered as client-only objects.
+- The host maps the server player id to a client target. After the client
+  reaches `GS_PLAYING`, `FearClient_PreparePortPlayer` attaches
+  `CPlayerCamera` to that target and switches it to first person. The camera
+  is updated and rendered every frame through the real v5 game code.
+- The host renders `CPlayerCamera` and draws `CInterfaceMgr` into the same
+  frame. This brings the first-person camera, the crosshair/health/armor HUD
+  and the real camera transform into the port for the first time.
+- The v113 renderer now parses the world material table, reads each `.Mat00`
+  header (LTMI v1), extracts the first DDS texture parameter, decodes the DDS
+  data and uploads a managed D3D9 texture per used material. Surfaces are
+  batched by material with UVs decoded from the per-stride vertex layouts.
+- Verified current parse: 2,268 surfaces, 1,979 visible surfaces, 289 excluded
+  shadow-volume surfaces, 508 materials, 457 used materials, 58,355 visible
+  triangles and 455 loaded material textures.
+- `ILTRenderer::MakeScreenShot` and the CShell render API now capture the
+  actual D3D9 back buffer/front buffer to a 32-bit BMP. `FEAR_CAPTURE_PATH`
+  captures the first mission frame without relying on a desktop screenshot.
+- A captured port frame shows the textured first-person view with HUD at
+  640x480. Lighting, lightmaps, `.fxo` shaders, models, weapon view models and
+  shadow volumes remain unimplemented, so the frame is still far from the 95%
+  visual parity gate.
+
+Remaining blockers for the stated goal:
+
+- The camera target is a registry object driven by the server transform. The
+  local `CCharacterFX`/move-manager path is not initialized, so
+  `GetClientObject` remains null and the client does not yet receive the full
+  local-player movement and weapon state.
+- HUD data is only partially populated because the player info and interface
+  messages are still filtered. Health, armor, ammo and weapon values need the
+  database/object mapping work.
+- The world is textured but unlit. Lightmaps, surface lighting, `.fxo`
+  materials, normal/tangent data, bump maps, fog, shadows and post-processing
+  are the next visual milestone.
+- `ILTModel`, `ILTCustomRender`, `ILTPhysicsSim` and most object services are
+  still stubs or incomplete; models, animation and object replication are not
+  present.
+- The `IsMultiplayerExe` patch and version-specific EngineServer offsets remain
+  a retail bootstrap dependency until the source-side server is implemented.

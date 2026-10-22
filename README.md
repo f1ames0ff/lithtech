@@ -23,11 +23,13 @@ The project has reached the first-mission startup milestone:
   InWorld messages;
 - the client reaches `GS_PLAYING` with a live server-side player in `Worlds\Release\Intro`.
 
-This is a startup milestone, not a finished playable mission. The current render path is still
-the flat v113 world preview. The real v5 `RenderCamera`, player camera, object replication, HUD,
-weapons, models, materials, lighting, collision and movement are not yet restored. The
-object-dependent messages are filtered until the v5 database records and server object handles
-are mapped to the client.
+This is a startup milestone, not a finished playable mission. The player camera is now attached
+to the server player and renders the v113 world through the v5 renderer callback; the interface
+manager also draws the HUD. The world is batched by material and 455 `.Mat00` textures are
+decoded and uploaded from the staged archives. Object replication, local-player movement,
+weapons, models, lightmaps, `.fxo` shaders, shadows and the remaining HUD state are still not
+restored. The object-dependent messages are filtered until the v5 database records and server
+object handles are mapped to the client.
 
 | Area | Current state |
 |---|---|
@@ -35,9 +37,10 @@ are mapped to the client.
 | LTAR v3 staging | Works |
 | v5 server bootstrap | Works |
 | First mission startup | `GS_PLAYING`, player Alive, `Worlds\Release\Intro` |
+| Player camera | Wired to the server player transform |
 | Playable movement / collision | Not yet |
-| HUD / weapons | Not yet |
-| Real v113 renderer | Not yet; flat preview only |
+| HUD / weapons | HUD draws; weapons and player values incomplete |
+| v113 renderer | Textured material batches; lighting and shadows missing |
 | 95% visual parity | Not yet measured or reached |
 | Source-only v5 server | Not yet |
 
@@ -138,10 +141,12 @@ and is not part of the repository or the final runtime.
 ## Next work
 
 1. Map the v5 database records and server object handles to client-side objects, then remove the
-   safe-message filter and restore HUD, weapons and movement state.
-2. Bind `GetClientObject` and the object transform APIs to the client object world; drive the
-   world camera from the player camera instead of the flat preview.
-3. Restore the v113 material, texture, shader, lighting and shadow pipeline.
+   safe-message filter and restore the local `CCharacterFX`/move-manager path, HUD values,
+   weapons and movement state.
+2. Bind `GetClientObject` to the local player and finish the object replication path; the camera
+   is already driven by the server player transform.
+3. Restore v113 lightmaps, surface lighting, `.fxo` shaders and shadow volumes; the material and
+   DDS texture path is already implemented.
 4. Port the MODL 33 model loader, animation and HUD services, using the retail renderer as the
    reference.
 5. Replace the retail server bootstrap with a source-side v5 server.
