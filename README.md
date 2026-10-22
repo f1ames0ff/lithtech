@@ -1,117 +1,155 @@
-Travis[![Build Status](https://travis-ci.org/Katana-Steel/lithtech.svg?branch=linux-x86_64)](https://travis-ci.org/Katana-Steel/lithtech)
-GL[![pipeline status](https://gitlab.com/Katana-Steel/lithtech/badges/linux-x86_64/pipeline.svg)](https://gitlab.com/Katana-Steel/lithtech/pipelines)
+# F.E.A.R. source port
 
-lithtech
-========
+Reverse engineering and source-port work for **F.E.A.R.** (Jupiter Ex, 2005), built on top of
+the Lithtech engine source tree.
 
-The engine code is from the apparent GPL release of the Jupiter Ex engine before Touchdown Entertainment disappeared. The GPL release was of the PC Enterprise Edition Build 69. Included were the game code and assets from NOLF2 and the game code from Tron 2.0. The code from the other games are from their respective public releases.
+The primary goal is not to write a look-alike from scratch. The goal is to recover the original
+engine behavior from the shipped `EngineServer.dll`, `GameServer.dll` and the retail client
+image, then reproduce it in source with measurable visual parity.
 
-Goal
-----
-I found the GPL release of the Jupiter Engine and couldn't find anyone else who had really seemed to do anything with it. I wanted to see how hard it would be to adapt it into a modern, multi-platform source port. I also wanted to see if it would be possible to port the other Lithtech release game code to the GPL release of the engine. Both have turned out to be much more work than I originally envisioned. Even though the effort is initially *extremely* rough, I thought I would put it up on GitHub so that I have a backup of my work and that no matter how far (or not) I get, my work will not disappear with me.
+![F.E.A.R. first mission reference](img.png)
 
-Status
-------
+*F.E.A.R. first mission reference frame. The visual target is the retail 1.08.282 renderer,
+HUD and weapon presentation, not a reinterpretation.*
 
-Currently the engine and NOLF2 game code will build with CMake to generate the project.
+## Status
 
-Windows screenshot:
+The project has reached the first-mission startup milestone:
 
-![nolf2 windows](https://cdn.discordapp.com/attachments/270406768750886912/642060349767680012/nolf2.jpg)
+- the source-built v5 client runs through the v4 `Lithtech.exe` with the existing client facade;
+- a retail v5 `EngineServer.dll` + `GameServer.dll` bootstrap can load
+  `Worlds\Release\Intro`;
+- the client and server now exchange the real connection, start-level, player-state and
+  InWorld messages;
+- the client reaches `GS_PLAYING` with a live server-side player in `Worlds\Release\Intro`.
 
-![LT on Linux](https://imgur.com/LOpCNfa.png)
+This is a startup milestone, not a finished playable mission. The current render path is still
+the flat v113 world preview. The real v5 `RenderCamera`, player camera, object replication, HUD,
+weapons, models, materials, lighting, collision and movement are not yet restored. The
+object-dependent messages are filtered until the v5 database records and server object handles
+are mapped to the client.
 
-![debug nolf2 windows](https://cdn.discordapp.com/attachments/270406768750886912/642412574725636167/nolf2_vs.png)
+| Area | Current state |
+|---|---|
+| Client + v5 facade | Builds and runs |
+| LTAR v3 staging | Works |
+| v5 server bootstrap | Works |
+| First mission startup | `GS_PLAYING`, player Alive, `Worlds\Release\Intro` |
+| Playable movement / collision | Not yet |
+| HUD / weapons | Not yet |
+| Real v113 renderer | Not yet; flat preview only |
+| 95% visual parity | Not yet measured or reached |
+| Source-only v5 server | Not yet |
 
-Requirements
-------------
+## Architecture
 
-- cmake
-- gcc or clang (Linux)
-- ms vs2017 (windows only)
-- SDL2
-- SDL2 image
-- SDL2 mixer
-- dx9 sdk (windows only)
-- ninja (optional)
-
-Quick how to get building
--------------------------
-
-```bash
-mkdir build
-cd build
-cmake -DJSON_BuildTests=off -G 'Ninja' ..
-cmake --build .
+```text
+Lithtech.exe (v4)
+  └─ CShell.dll
+      └─ FearHost.dll
+          ├─ GameClient.dll        source-built v5 client
+          ├─ GameServer.dll        retail v5 server game code
+          └─ EngineServer.dll      retail v5 server engine
 ```
-Ninja above can be replaced with what makes sense on your platform. 
 
-TODO
-----
-* Fix the secure standard library exceptions so that a Debug build under VS2010 will run.
-* Port/adapt all the game code to run on the GPL engine. Each game was written to a different version of the engine. So, theoretically this is possible, but it could take a substantial amount of work.
-* Remove the Windows dependencies. The engine is heavily oriented towards Windows (even though there is a bit of Linux code).
-    * Replace the usage of MFC with wxWidgets in the tools. (MFC and wxWidgets are close enough that it shouldn't be too painful.)
-    * Replace DirectInput and other Windows specific code with SDL.
-    * Create a new audio driver based on SDL and/or OpenAL.
-    * Create a new OpenGL or Vulkan renderer.
-* Long term, it might be cool to bring back something similar to the renderer DLLs that Shogo used. In this version of the engine, the renderer is statically linked to the engine.
+The two generations are deliberately separated: the v4 engine owns the host and the source
+client, while the retail v5 server stays in its native MSVC 7.1 world. The bridge uses only
+interfaces with POD/handle arguments and raw messages. This keeps the v5 renderer path open
+without pretending that the v4 and v5 engine databases and object layouts are interchangeable.
 
-Games I want to support and the order to work on them
------------------------------------------------------
-1. No One Lives Forever 2: A Spy in H.A.R.M.'s Way
-2. Tron 2.0 (if I can find a copy)
-3. Shogo
-4. The Operative: No One Lives Forever
-5. F.E.A.R.
-6. Blood II: The Chosen (if I can find a copy)
+The retail `EngineServer.dll` and `GameServer.dll` are currently a bootstrap for reaching the
+first mission. They are not the final source-only server. Internal offsets and the
+`IsMultiplayerExe` patch are isolated in `FEAR/Compat/v5host/fear_server_host.cpp` and must be
+replaced by a source-side `IServerShell`/`ILTServer` implementation.
 
-These are all the Lithtech I am aware of that had a public source release. If there are more out there, I want to eventually support them too.
+## Reverse engineering
 
-Recent Developments
-===================
-After trying things out, I've managed to setup an automated build test with Travis-CI
-from github, and I keep a mirror on gitlab which also automatically builds Lithtech
-engine and and supporting libraries.
+The reverse-engineering workspace and IDA databases live outside this repository:
 
-On GitLab two builds are happening 1 for gcc and 1 for clang, to get a diversity in
-build tools used. Each are done with a docker build env which has latest stable cmake,
-and up to date GCC and Clang, at the time of writing.
+- `D:\fear-re\re\ida\work\EngineServer.dll.i64`
+- `D:\fear-re\re\ida\decompiled-full`
+- `D:\fear-re\re\ida\decompiled-gameserver`
 
-- Katana-Steel
+The work uses IDA Pro 9.3 headless with the published corpus workflow. Findings are validated
+against build `1.08.282`; offsets are not assumed to be portable. The current investigation
+covers:
 
-Builds on Windows
------------------
+- the v5 local client record (`0x60` bytes), connection state and `OnAddClient` /
+  `OnClientEnterWorld` callbacks;
+- `MID_*` game-message encoding and the server/client connection state machine;
+- the v113 world render section, material table and shadow-volume split;
+- `.Mat00`/`.fxo`, `.Model00p`, DDS and animation formats;
+- the retail client image as a visual and behavioral reference. The client image is packed;
+  runtime capture and RenderDoc/DXVK are used instead of assuming static addresses.
 
-There are a few reasons why I am implementing a new build system:
-* All code releases were either using VC++ 6 or Visual Studio 2003 (VC++ 7.1). Neither type of project file converted that well in VS2010.
-* Since the ultimate goal is a source port, I would like to be able to build the games on Linux and OS X as well. There was a homegrown converter for VC++ 7.1 project files to makefiles, but given then problems converting between versions of Visual Studio, I decided against it.
-* I don't want to require someone to use Visual Studio on Windows. It should at least be buildable by MinGW as well (if not OpenWatcom too).
+Every recovered behavior should have an address, a decompiled function, a source location or a
+measured asset-format result behind it. Plausible invented behavior is not acceptance evidence.
 
-I can get NOLF2 running. Interestingly enough, a release build seems to run okay, but a debug build will trigger exceptions in the standard library. All the problem seem to have to do with Microsoft's secure CRT. Either things had slightly different semantics between compilers or certain iterator usages were technically not correct in the original code. I fixed maybe two of these. There are still probably another handful left. There also seems to be some differences in the NOLF2 retail data files and those supplied with the GPL release. I am not 100% certain of this, but I need to investigate more.
+## Building
 
-I also started an effort to port the Shogo source (originally from a really old version of the engine) to the engine in the GPL release. I have made a *ton* of changes, but it still doesn't compile completely. I decided to focus on getting a single tree build and debug version of NOLF2 running first.
+Windows, Debug x86 is the default development configuration:
 
+```powershell
+.\tools\build_windows.ps1 -Configuration Debug
+```
 
-Builds on linux
----------------
-Since Linux doesn't have a global registry systems, the RegMgr was reimplemented with a JSON file as the backend.
+Build the source `GameClient.dll` against the Public Tools SDK:
 
-The CRes.dll or Client Resources was replaced by libDynRes which currently only supports compiling strings(stringtable) from a Windows style rc file.
-The RC file is parsed by a python script which generates a single source C++ file that inturn is compiled into a dynamic library.
+```powershell
+.\tools\build_fear_client.ps1 `
+  -PublicToolsDir "D:\SteamLibrary\steamapps\common\FEAR Ultimate Shooter Edition\FEAR Public Tools 1.08"
+```
 
-and generally stubbed out every function/class needed to compile the engine.
+The F.E.A.R. port is an isolated CMake configuration (`BUILD_FEAR_PORT=ON`) and writes its
+artifacts to `build-fear/OUT_FEAR`. See `BUILD_WINDOWS.md` for toolchain, DirectX SDK and SDL2
+requirements.
 
+## Running
 
-Past work
-=========
-Hai, MWisBest here.
+Stage a writable run directory from the retail installation:
 
-It turns out that the NOLF2 assets included with the "GPL" release are indeed different than the retail NOLF2 assets. This code is technically working OK in its current state, but only with those "GPL" assets; the problem is that the "GPL" assets aren't complete. They really only include the first part of the first level (world) of the game for the campaign. The old (retail) versions of the WORLD files do not work directly with this newer Lithtech engine build.
+```powershell
+.\tools\run_fear_port.ps1 `
+  -RetailDir "D:\SteamLibrary\steamapps\common\FEAR Ultimate Shooter Edition" `
+  -GameClientDll "build-fear-client\GameClient.dll"
+```
 
-There's a few options to maybe get the entirety of NOLF2 working with this code:
+For deterministic startup tests, set `FEAR_AUTOSTART=1`; this drives `StartGameNew` without
+menu input. `tools/run_on_desktop.ps1` can launch the stage on a separate Win32 desktop when a
+visible interactive desktop is needed.
 
-1. Figure out the difference between formats and rework the engine to support both. (very unlikely)
-2. Locate an old version of Maya or 3ds Max (version 3 or 4 of either) to use the retail game's import plugin for, and then this release's export plugin, to "convert" them to the new format. (haven't been able to find an old Maya or 3ds Max so far)
-3. Recreate the levels from scratch. Really give the entire game a proper remake. (beyond *my* capabilities)
+A local development machine currently needs a DXVK `d3d9.dll` in the staging directory because
+its native D3D9 `CreateDevice` path reports `D3DERR_DEVICELOST`; DXVK is a test workaround only
+and is not part of the repository or the final runtime.
 
+## Repository map
+
+| Path | Purpose |
+|---|---|
+| `FEAR/Compat/v5host` | v5 client facade, server bootstrap, message bridge |
+| `FEAR/Compat/cshell` | v4-to-v5 host proxy and v113 world preview |
+| `FEAR/Compat/publictools_client` | source-client exports and startup/preload hooks |
+| `runtime` | Lithtech engine |
+| `tools` | build, stage, desktop and inspection scripts |
+| `docs/FEAR_PORT_PLAN.md` | architecture, milestones and reverse-engineering log |
+| `docs/FEAR_ACCEPTANCE.md` | first-mission and visual-parity acceptance gates |
+| `BUILD_WINDOWS.md` | Windows build and staging instructions |
+
+## Next work
+
+1. Map the v5 database records and server object handles to client-side objects, then remove the
+   safe-message filter and restore HUD, weapons and movement state.
+2. Bind `GetClientObject` and the object transform APIs to the client object world; drive the
+   world camera from the player camera instead of the flat preview.
+3. Restore the v113 material, texture, shader, lighting and shadow pipeline.
+4. Port the MODL 33 model loader, animation and HUD services, using the retail renderer as the
+   reference.
+5. Replace the retail server bootstrap with a source-side v5 server.
+6. Run the fixed-camera retail/port comparison at 640×480 and report the 95% parity gate honestly.
+
+## Provenance
+
+This repository contains engine code derived from the GPL release of the Jupiter Ex engine, with
+additional game code and port work. F.E.A.R. retail assets, archives and engine binaries are not
+distributed with this repository; they are used locally as a reference against an owned
+installation.
