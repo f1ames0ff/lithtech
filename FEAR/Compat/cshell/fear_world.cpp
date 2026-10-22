@@ -5,6 +5,7 @@
 #include <string.h>
 #include <math.h>
 #include <vector>
+#include <string>
 #include <new>
 
 struct FearWorldVertex
@@ -39,6 +40,22 @@ static float FearReadF32(const unsigned char *p)
     float f;
     memcpy(&f, &n, sizeof(f));
     return f;
+}
+
+static bool FearIsShadowVolumeMaterial(const std::string &name)
+{
+    std::string normalized;
+    normalized.reserve(name.size());
+    for (size_t i = 0; i < name.size(); ++i)
+    {
+        char c = name[i];
+        if (c == '/')
+            c = '\\';
+        if (c >= 'A' && c <= 'Z')
+            c = (char)(c - 'A' + 'a');
+        normalized.push_back(c);
+    }
+    return normalized == "engine\\shadowvolume.mat00";
 }
 
 static bool FearReadWorldFile(const char *pszFilename, std::vector<unsigned char> &data)
@@ -177,7 +194,23 @@ int FearWorld_Load(const char *pszFilename)
     if (nSurfaces != nSurfaceCount || o + (size_t)nSurfaces * 36 > data.size())
         return 0;
 
-    bool bHaveBounds = false;
+    std::vector<std::string> materialNames;
+    materialNames.reserve(nMaterialCount);
+    size_t nMaterialOffset = o + (size_t)nSurfaces * 36;
+    for (unsigned int i = 0; i < nMaterialCount; ++i)
+    {
+        if (nMaterialOffset + 2 > data.size())
+            return 0;
+        unsigned int nLength = FearReadU16(data.data() + nMaterialOffset);
+        nMaterialOffset += 2;
+        if (nMaterialOffset + nLength > data.size())
+            return 0;
+        materialNames.push_back(std::string((const char *)data.data() + nMaterialOffset, nLength));
+        nMaterialOffset += nLength;
+    }
+
+    unsigned int nVisibleSurfaces = 0;
+    unsigned int nSkippedSurfaces = 0;
     for (unsigned int i = 0; i < nSurfaces; ++i)
     {
         const unsigned char *pSurface = data.data() + o + (size_t)i * 36;
@@ -188,6 +221,13 @@ int FearWorld_Load(const char *pszFilename)
         unsigned int nIndexBase = FearReadU32(pSurface + 16);
         unsigned int nIndexCount = FearReadU32(pSurface + 20);
         unsigned int nMaterial = FearReadU32(pSurface + 24);
+
+        if (nMaterial < materialNames.size() && FearIsShadowVolumeMaterial(materialNames[nMaterial]))
+        {
+            ++nSkippedSurfaces;
+            continue;
+        }
+        ++nVisibleSurfaces;
 
         if (nVertexSize < 12 || nVertices == 0)
             continue;
@@ -226,8 +266,9 @@ int FearWorld_Load(const char *pszFilename)
         if (v.z > g_WorldMax[2]) g_WorldMax[2] = v.z;
     }
 
-    printf("FEARWORLD: surfaces=%u materials=%u vertices=%u triangles=%u bounds=(%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f)\n",
-        nSurfaceCount, nMaterialCount, (unsigned)g_WorldVertices.size(), (unsigned)(g_WorldVertices.size() / 3),
+    printf("FEARWORLD: surfaces=%u visible_surfaces=%u skipped_shadow_surfaces=%u materials=%u vertices=%u triangles=%u bounds=(%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f)\n",
+        nSurfaceCount, nVisibleSurfaces, nSkippedSurfaces, nMaterialCount,
+        (unsigned)g_WorldVertices.size(), (unsigned)(g_WorldVertices.size() / 3),
         g_WorldMin[0], g_WorldMin[1], g_WorldMin[2], g_WorldMax[0], g_WorldMax[1], g_WorldMax[2]);
     fflush(stdout);
     return 1;

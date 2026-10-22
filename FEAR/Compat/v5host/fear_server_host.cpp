@@ -1,19 +1,24 @@
 #include "fear_server_host.h"
+#include "fear_messageread_stub.h"
 
 #include <windows.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <string>
 #include <vector>
 
 #include "ltbasedefs.h"
 #include "ltguid.h"
+#include "iltmessage.h"
 #include "server_interface.h"
 
 typedef SI_CREATESTATUS(__cdecl *TFearCreateServer)(int, LTGUID &, ServerInterface **);
 typedef void(__cdecl *TFearDeleteServer)();
 typedef void(__thiscall *TFearStringCtor)(void *);
 typedef void(__thiscall *TFearStringAssign)(void *, const char *);
+
+static bool g_bServerWorldLoaded = false;
 
 class CFearServerAppHandler : public ServerAppHandler
 {
@@ -24,6 +29,8 @@ public:
         {
             printf("FEARSERVER: %s", pMsg);
             fflush(stdout);
+            if (strstr(pMsg, "World loaded"))
+                g_bServerWorldLoaded = true;
         }
         return LT_OK;
     }
@@ -49,31 +56,24 @@ static unsigned char g_NetGameInfo[176];
 static TFearStringAssign g_pfnStringAssign = NULL;
 static TFearServerMessageSink g_pfnMessageSink = NULL;
 static std::vector<ILTMessage_Read *> g_MessageQueue;
+static std::vector<ILTMessage_Read *> g_ClientMessageQueue;
 static bool g_bLocalClientEnabled = false;
+static void *g_hServerClient = NULL;
+static void *g_hServerPlayer = NULL;
 
 static bool FearServerLocalClientEnabled(void)
 {
     char szValue[8] = {0};
     DWORD nLen = GetEnvironmentVariableA("FEAR_LOCAL_CLIENT", szValue, sizeof(szValue));
-    return nLen > 0 && szValue[0] != '0';
+    if (nLen > 0 && szValue[0] == '0')
+        return false;
+    return true;
 }
 
 static void FearServerLog(const char *pszText)
 {
     printf("FEARSERVER: %s\n", pszText ? pszText : "");
     fflush(stdout);
-}
-
-static unsigned int __stdcall FearServerFakeGetClientID(void *)
-{
-    return 0;
-}
-
-static char __stdcall FearServerFakeGetClientData(void *, void *, unsigned int *pSize)
-{
-    if (pSize)
-        *pSize = 0;
-    return 0;
 }
 
 static int __stdcall FearServerFakeGetClientAddr(void *, unsigned char *pAddr, unsigned short *pPort)
@@ -89,8 +89,17 @@ static LTRESULT __stdcall FearServerFakeSendToClient(ILTMessage_Read *pMessage, 
 {
     if (pMessage && g_MessageQueue.size() < 4096)
     {
-        pMessage->AddRef();
-        g_MessageQueue.push_back(pMessage);
+        uint32 nBits = pMessage->Size();
+        uint32 nSaved = pMessage->Tell();
+        std::vector<unsigned char> bytes((nBits + 7) >> 3, 0);
+        pMessage->SeekTo(0);
+        if (nBits)
+            pMessage->ReadData(bytes.data(), nBits);
+        pMessage->SeekTo(nSaved);
+
+        CFearMessageRead *pCopy = new CFearMessageRead;
+        pCopy->SetData(bytes.empty() ? NULL : bytes.data(), nBits);
+        g_MessageQueue.push_back(pCopy);
     }
     return LT_OK;
 }
@@ -125,6 +134,43 @@ static void FearServerPatchCode(HMODULE hEngine, uintptr_t nOffset, const unsign
         VirtualProtect(pCode, nSize, nOldProtect, &nIgnored);
         FlushInstructionCache(GetCurrentProcess(), pCode, nSize);
     }
+}
+
+static bool FearServerCreateLocalClient(void)
+{
+    if (!g_hEngineServer || !g_pServer)
+        return false;
+
+    void *pShell = *(void **)((uintptr_t)g_hEngineServer + 0xF911C);
+    if (!pShell)
+    {
+        FearServerLog("server shell is not available");
+        return false;
+    }
+
+    void **pShellVtable = *(void ***)pShell;
+    typedef void(__thiscall *TOnAddClient)(void *, void *);
+    TOnAddClient pfnAddClient = (TOnAddClient)pShellVtable[15];
+
+    unsigned char *pClient = (unsigned char *)calloc(1, 0x60);
+    if (!pClient)
+        return false;
+    *(unsigned short *)(pClient + 0x34) = 0;
+    *(unsigned int *)(pClient + 0x40) = 0x0B;
+
+    pfnAddClient(pShell, pClient);
+
+    typedef void(__cdecl *TClientConnected)(void *);
+    TClientConnected pfnConnected = (TClientConnected)((char *)g_hEngineServer + 0x41810);
+    pfnConnected(pClient);
+
+    g_hServerClient = pClient;
+    g_hServerPlayer = *(void **)(pClient + 0x5C);
+
+    printf("FEARSERVER: local client=%p state=%u flags=%08x player=%p\n",
+        pClient, *(unsigned int *)(pClient + 0x38), *(unsigned int *)(pClient + 0x40), g_hServerPlayer);
+    fflush(stdout);
+    return g_hServerPlayer != NULL;
 }
 
 static void FearServerGetDirectory(char *pszDir, size_t nSize)
@@ -216,6 +262,7 @@ bool FearServerHost_Start(const char *pszWorldName)
     if (g_bServerRunning)
         FearServerHost_Shutdown();
 
+    g_bServerWorldLoaded = false;
     char szDir[MAX_PATH];
     FearServerGetDirectory(szDir, sizeof(szDir));
     if (!szDir[0])
@@ -288,12 +335,6 @@ bool FearServerHost_Start(const char *pszWorldName)
     {
         FearServerPatchVtable(g_hEngineServer, 105, (void *)FearServerFakeGetClientAddr);
         FearServerPatchVtable(g_hEngineServer, 94, (void *)FearServerFakeSendToClient);
-        FearServerPatchVtable(g_hEngineServer, 103, (void *)FearServerFakeGetClientData);
-        *(uint32_t *)((uintptr_t)g_hEngineServer + 0xF72F0 + 56) = (uint32_t)(uintptr_t)FearServerFakeGetClientID;
-        static const unsigned char s_SetClientNameOk[] = {0xB0, 0x01, 0xC3};
-        static const unsigned char s_FinishClientConnectOk[] = {0x31, 0xC0, 0xC2, 0x04, 0x00};
-        FearServerPatchCode(g_hEngineServer, 0x4B1B0, s_SetClientNameOk, sizeof(s_SetClientNameOk));
-        FearServerPatchCode(g_hEngineServer, 0x4BAB0, s_FinishClientConnectOk, sizeof(s_FinishClientConnectOk));
     }
 
     g_pServer->SetAppHandler(&g_ServerHandler);
@@ -343,47 +384,91 @@ bool FearServerHost_Start(const char *pszWorldName)
         return false;
     }
 
-    StartGameRequest request;
-    memset(&request, 0, sizeof(request));
-    request.m_Type = STARTGAME_NORMAL;
-    if (pszWorldName && pszWorldName[0])
+    if (g_bLocalClientEnabled)
+        FearServerCreateLocalClient();
+
+    if (pszWorldName)
+    {
+        StartGameRequest request;
+        memset(&request, 0, sizeof(request));
+        request.m_Type = STARTGAME_NORMAL;
         strncpy(request.m_WorldName, pszWorldName, sizeof(request.m_WorldName) - 1);
-    else
-        strncpy(request.m_WorldName, "Worlds\\Release\\Intro.World00p", sizeof(request.m_WorldName) - 1);
 
-    if (!g_pServer->StartWorld(&request))
-    {
-        wchar_t wszError[1024] = L"";
-        g_pServer->GetErrorString(wszError, 1024);
-        wprintf(L"FEARSERVER: StartWorld failed: %ls\n", wszError);
-        fflush(stdout);
-        FearServerHost_Shutdown();
-        return false;
-    }
-
-    void *pShell = *(void **)((uintptr_t)g_hEngineServer + 0xF911C);
-    if (g_bLocalClientEnabled && pShell)
-    {
-        void **pVtable = *(void ***)pShell;
-        typedef void (__thiscall *TOnAddClient)(void *, void *);
-        typedef void *(__thiscall *TOnClientEnterWorld)(void *, void *);
-        TOnAddClient pfnAddClient = (TOnAddClient)pVtable[15];
-        TOnClientEnterWorld pfnEnterWorld = (TOnClientEnterWorld)pVtable[5];
-        pfnAddClient(pShell, (void *)1);
-        void *pPlayer = pfnEnterWorld(pShell, (void *)1);
-        printf("FEARSERVER: local client player=%p\n", pPlayer);
-        fflush(stdout);
+        if (!g_pServer->StartWorld(&request))
+        {
+            wchar_t wszError[1024] = L"";
+            g_pServer->GetErrorString(wszError, 1024);
+            wprintf(L"FEARSERVER: StartWorld failed: %ls\n", wszError);
+            fflush(stdout);
+            FearServerHost_Shutdown();
+            return false;
+        }
     }
 
     g_bServerRunning = true;
-    FearServerLog("world started");
+    FearServerLog(pszWorldName ? "world started" : "server started");
     return true;
 }
 
 void FearServerHost_Update(void)
 {
-    if (g_bServerRunning && g_pServer)
-        g_pServer->Update(0);
+    if (!g_bServerRunning || !g_pServer)
+        return;
+
+    void *pShell = *(void **)((uintptr_t)g_hEngineServer + 0xF911C);
+    if (pShell && g_hServerClient)
+    {
+        while (!g_ClientMessageQueue.empty())
+        {
+            ILTMessage_Read *pMessage = g_ClientMessageQueue.front();
+            g_ClientMessageQueue.erase(g_ClientMessageQueue.begin());
+            if (pMessage)
+            {
+                pMessage->SeekTo(0);
+                void **pVtable = *(void ***)pShell;
+                typedef void(__thiscall *TOnMessage)(void *, void *, ILTMessage_Read *);
+                TOnMessage pfnOnMessage = (TOnMessage)pVtable[10];
+                pfnOnMessage(pShell, g_hServerClient, pMessage);
+                pMessage->Release();
+            }
+        }
+    }
+
+    g_pServer->Update(0);
+
+    if (g_hServerClient)
+    {
+        g_hServerPlayer = *(void **)((unsigned char *)g_hServerClient + 0x5C);
+        if (!g_hServerPlayer)
+        {
+            if (g_bServerWorldLoaded)
+            {
+                typedef void(__cdecl *TClientEnterWorld)(void *);
+                TClientEnterWorld pfnEnterWorld = (TClientEnterWorld)((char *)g_hEngineServer + 0x41750);
+                pfnEnterWorld(g_hServerClient);
+                g_hServerPlayer = *(void **)((unsigned char *)g_hServerClient + 0x5C);
+            }
+            if (!g_hServerPlayer)
+            {
+                typedef void(__cdecl *TClientConnected)(void *);
+                TClientConnected pfnConnected = (TClientConnected)((char *)g_hEngineServer + 0x41810);
+                pfnConnected(g_hServerClient);
+                g_hServerPlayer = *(void **)((unsigned char *)g_hServerClient + 0x5C);
+            }
+            if (g_hServerPlayer)
+            {
+                printf("FEARSERVER: player connected=%p\n", g_hServerPlayer);
+                fflush(stdout);
+            }
+        }
+    }
+}
+
+void FearServerHost_SubmitClientMessage(ILTMessage_Read *pMessage)
+{
+    if (!pMessage)
+        return;
+    g_ClientMessageQueue.push_back(pMessage);
 }
 
 void FearServerHost_DeliverMessages(void)
@@ -417,6 +502,13 @@ void FearServerHost_Shutdown(void)
         if (pMessage)
             pMessage->Release();
     }
+    while (!g_ClientMessageQueue.empty())
+    {
+        ILTMessage_Read *pMessage = g_ClientMessageQueue.front();
+        g_ClientMessageQueue.erase(g_ClientMessageQueue.begin());
+        if (pMessage)
+            pMessage->Release();
+    }
     if (g_pServer)
     {
         if (g_pfnDeleteServer)
@@ -425,6 +517,8 @@ void FearServerHost_Shutdown(void)
     }
     g_bServerRunning = false;
     g_bLocalClientEnabled = false;
+    g_hServerClient = NULL;
+    g_hServerPlayer = NULL;
     g_pfnDeleteServer = NULL;
     g_pfnStringAssign = NULL;
     if (g_hMsvcp71)
@@ -442,4 +536,14 @@ void FearServerHost_Shutdown(void)
 bool FearServerHost_IsRunning(void)
 {
     return g_bServerRunning;
+}
+
+void *FearServerHost_GetClientHandle(void)
+{
+    return g_hServerClient;
+}
+
+void *FearServerHost_GetPlayerObject(void)
+{
+    return g_hServerPlayer;
 }

@@ -9,6 +9,7 @@
 #include "ltmodule.h"
 #include "iclientshell.h"
 #include "iltclient.h"
+#include "iltmessage.h"
 #include "fear_client_facade.h"
 #include "fear_server_host.h"
 #include "fear_resourcemgr_stub.h"
@@ -60,6 +61,12 @@ typedef void (*TFearClientMouseMove)(int, int);
 typedef void (*TFearClientMouseButton)(int, int, int, int);
 typedef void (*TFearClientMouseWheel)(int, int, int);
 typedef void (*TFearClientDisableWindowHook)();
+typedef void (*TFearClientPreLoadWorld)(const char *);
+typedef void (*TFearClientOnEnterWorld)();
+typedef void (*TFearClientLogState)();
+typedef int (*TFearClientIsPostload)();
+typedef void (*TFearClientPressKey)(int);
+typedef void (*TFearClientReplySaveFailed)();
 typedef void (*TFearClientEnterWorldPreview)();
 typedef void (*TFearClientRenderWorldPreview)();
 typedef int (*TFearClientStartNewGame)();
@@ -68,11 +75,18 @@ static TFearClientMouseMove g_pfnClientMouseMove = NULL;
 static TFearClientMouseButton g_pfnClientMouseButton = NULL;
 static TFearClientMouseWheel g_pfnClientMouseWheel = NULL;
 static TFearClientDisableWindowHook g_pfnClientDisableWindowHook = NULL;
+static TFearClientPreLoadWorld g_pfnClientPreLoadWorld = NULL;
+static TFearClientOnEnterWorld g_pfnClientOnEnterWorld = NULL;
+static TFearClientLogState g_pfnClientLogState = NULL;
+static TFearClientIsPostload g_pfnClientIsPostload = NULL;
+static TFearClientPressKey g_pfnClientPressKey = NULL;
+static TFearClientReplySaveFailed g_pfnClientReplySaveFailed = NULL;
 static TFearClientEnterWorldPreview g_pfnClientEnterWorldPreview = NULL;
 static TFearClientRenderWorldPreview g_pfnClientRenderWorldPreview = NULL;
 static TFearClientStartNewGame g_pfnClientStartNewGame = NULL;
 
 static bool g_bWorldPreview = false;
+static bool g_bAwaitPostload = false;
 static bool g_bPreviewKeys[256] = {false};
 static float g_fPreviewPos[3] = { -1100.0f, -1372.0f, -370.0f };
 static float g_fPreviewYaw = -0.0784588f;
@@ -92,15 +106,64 @@ extern "C" void FearHost_DeliverServerMessage(ILTMessage_Read *pMessage)
 {
     if (!g_pShell || !pMessage)
         return;
-    if (!g_bWorldPreview)
+
+    uint32 nSaved = pMessage->Tell();
+    unsigned char nMessageID = (unsigned char)pMessage->ReadBits(8);
+    pMessage->SeekTo(nSaved);
+
+    unsigned char nMessageState = 0;
+    printf("FEARPORT: server message id=%u", (unsigned)nMessageID);
+    if (nMessageID == 187)
     {
-        g_bWorldPreview = true;
-        g_bPreviewMouseInitialized = false;
-        g_nPreviewLastTick = GetTickCount();
-        if (g_pfnClientEnterWorldPreview)
-            g_pfnClientEnterWorldPreview();
+        printf(" save-data refused\n");
+        fflush(stdout);
+        if (g_pfnClientReplySaveFailed)
+            g_pfnClientReplySaveFailed();
+        return;
     }
+    if (nMessageID == 103 || nMessageID == 126 || nMessageID == 129 || nMessageID == 145 ||
+        nMessageID == 212 || nMessageID == 231 || nMessageID == 229 ||
+        nMessageID == 233 || nMessageID == 230 || nMessageID == 138)
+    {
+        printf(" skipped\n");
+        fflush(stdout);
+        return;
+    }
+    pMessage->SeekTo(nSaved);
+    pMessage->ReadBits(8);
+    if (nMessageID == 160)
+        printf(" pause=%u", (unsigned)pMessage->ReadBits(1));
+    else if (nMessageID == 245 || nMessageID == 195 || nMessageID == 105)
+    {
+        nMessageState = (unsigned char)pMessage->ReadBits(8);
+        printf(" state=%u", (unsigned)nMessageState);
+    }
+    printf("\n");
+    fflush(stdout);
+    pMessage->SeekTo(nSaved);
+    if (nMessageID == 245 && nMessageState == 12)
+        g_bAwaitPostload = true;
+
+    char szWorld[MAX_PATH] = {0};
+    if (nMessageID == 186)
+    {
+        pMessage->SeekTo(nSaved);
+        pMessage->ReadBits(8);
+        pMessage->ReadString(szWorld, sizeof(szWorld));
+        pMessage->SeekTo(nSaved);
+    }
+
     g_pShell->OnMessage(pMessage);
+
+    static bool s_bWorldLoadTriggered = false;
+    if (!s_bWorldLoadTriggered && (nMessageID == 186 || nMessageID == 195) && g_pfnClientPreLoadWorld)
+    {
+        const char *pszWorld = szWorld[0] ? szWorld : "Worlds\\Release\\Intro.World00p";
+        g_pfnClientPreLoadWorld(pszWorld);
+        if (g_pfnClientOnEnterWorld)
+            g_pfnClientOnEnterWorld();
+        s_bWorldLoadTriggered = true;
+    }
 }
 
 const FearEngineApi *FearHost_GetEngineApi(void)
@@ -110,6 +173,8 @@ const FearEngineApi *FearHost_GetEngineApi(void)
 
 extern "C" __declspec(dllexport) int FearHost_Init(const char *pszGameClientDll, const FearEngineApi *pApi)
 {
+    setvbuf(stdout, NULL, _IONBF, 0);
+    setvbuf(stderr, NULL, _IONBF, 0);
     g_pEngineApi = pApi;
     CInterfaceDatabase *pMaster = GetMasterDatabase();
     g_hGameClient = LoadLibraryA(pszGameClientDll);
@@ -123,6 +188,12 @@ extern "C" __declspec(dllexport) int FearHost_Init(const char *pszGameClientDll,
     g_pfnClientMouseButton = (TFearClientMouseButton)GetProcAddress(g_hGameClient, "FearClient_MouseButton");
     g_pfnClientMouseWheel = (TFearClientMouseWheel)GetProcAddress(g_hGameClient, "FearClient_MouseWheel");
     g_pfnClientDisableWindowHook = (TFearClientDisableWindowHook)GetProcAddress(g_hGameClient, "FearClient_DisableWindowHook");
+    g_pfnClientPreLoadWorld = (TFearClientPreLoadWorld)GetProcAddress(g_hGameClient, "FearClient_PreLoadWorld");
+    g_pfnClientOnEnterWorld = (TFearClientOnEnterWorld)GetProcAddress(g_hGameClient, "FearClient_OnEnterWorld");
+    g_pfnClientLogState = (TFearClientLogState)GetProcAddress(g_hGameClient, "FearClient_LogState");
+    g_pfnClientIsPostload = (TFearClientIsPostload)GetProcAddress(g_hGameClient, "FearClient_IsPostload");
+    g_pfnClientPressKey = (TFearClientPressKey)GetProcAddress(g_hGameClient, "FearClient_PressKey");
+    g_pfnClientReplySaveFailed = (TFearClientReplySaveFailed)GetProcAddress(g_hGameClient, "FearClient_ReplySaveFailed");
     g_pfnClientEnterWorldPreview = (TFearClientEnterWorldPreview)GetProcAddress(g_hGameClient, "FearClient_EnterWorldPreview");
     g_pfnClientRenderWorldPreview = (TFearClientRenderWorldPreview)GetProcAddress(g_hGameClient, "FearClient_RenderWorldPreview");
     g_pfnClientStartNewGame = (TFearClientStartNewGame)GetProcAddress(g_hGameClient, "FearClient_StartNewGame");
@@ -167,44 +238,17 @@ extern "C" __declspec(dllexport) void FearHost_Update(void)
     if (!g_pShell)
         return;
 
-    static int s_nConnectedFrames = 0;
-    if (g_bFearConnected)
-        ++s_nConnectedFrames;
-
-    if (s_nConnectedFrames > 120)
-    {
-        g_pShell->PreUpdate();
-        g_pShell->Update();
-        g_pShell->PostUpdate();
-        FearServerHost_DeliverMessages();
-
-        DWORD nNow = GetTickCount();
-        float fDelta = (float)(nNow - g_nPreviewLastTick) * 0.001f;
-        g_nPreviewLastTick = nNow;
-        if (fDelta > 0.1f)
-            fDelta = 0.1f;
-
-        float fForward = (g_bPreviewKeys[0x26] ? 1.0f : 0.0f) - (g_bPreviewKeys[0x28] ? 1.0f : 0.0f);
-        float fStrafe = (g_bPreviewKeys[0x27] ? 1.0f : 0.0f) - (g_bPreviewKeys[0x25] ? 1.0f : 0.0f);
-        float fUp = (g_bPreviewKeys[0x20] ? 1.0f : 0.0f) - (g_bPreviewKeys[0x11] ? 1.0f : 0.0f);
-        float fSpeed = (g_bPreviewKeys[0x10] ? 1200.0f : 500.0f) * fDelta;
-
-        float fSin = sinf(g_fPreviewYaw);
-        float fCos = cosf(g_fPreviewYaw);
-        g_fPreviewPos[0] += (fSin * fForward + fCos * fStrafe) * fSpeed;
-        g_fPreviewPos[1] += fUp * fSpeed;
-        g_fPreviewPos[2] += (fCos * fForward - fSin * fStrafe) * fSpeed;
-        FearHost_UpdatePreviewCamera();
-
-        if (g_pfnClientRenderWorldPreview)
-            g_pfnClientRenderWorldPreview();
-        return;
-    }
+    FearServerHost_DeliverMessages();
 
     g_pShell->PreUpdate();
     g_pShell->Update();
     g_pShell->PostUpdate();
-    FearServerHost_DeliverMessages();
+
+    if (g_bAwaitPostload && g_pfnClientIsPostload && g_pfnClientIsPostload() && g_pfnClientPressKey)
+    {
+        g_pfnClientPressKey(VK_SPACE);
+        g_bAwaitPostload = false;
+    }
 
     static int s_nMenuFrames = 0;
     static int s_nAutoStartAttempts = 0;
@@ -216,24 +260,15 @@ extern "C" __declspec(dllexport) void FearHost_Update(void)
         s_bAutoStart = (nLen > 0 && szAutoStart[0] != '0') ? 1 : 0;
     }
     ++s_nMenuFrames;
+    if (g_pfnClientLogState && (s_nMenuFrames % 300) == 0)
+        g_pfnClientLogState();
     if (s_bAutoStart && !g_bFearConnected && g_pfnClientStartNewGame &&
-        s_nMenuFrames > 120 && s_nAutoStartAttempts < 5 && (s_nMenuFrames % 60) == 0)
+        s_nMenuFrames > 120 && s_nAutoStartAttempts < 1 && (s_nMenuFrames % 60) == 0)
     {
         ++s_nAutoStartAttempts;
         int nStarted = g_pfnClientStartNewGame();
         printf("FEARPORT: auto-start new game attempt=%d result=%d\n", s_nAutoStartAttempts, nStarted);
         fflush(stdout);
-    }
-
-    if (!g_bWorldPreview && s_nConnectedFrames == 120 && g_pfnClientEnterWorldPreview)
-    {
-        printf("FEARPORT: entering world preview\n");
-        fflush(stdout);
-        g_bWorldPreview = true;
-        g_bPreviewMouseInitialized = false;
-        g_nPreviewLastTick = GetTickCount();
-        FearHost_UpdatePreviewCamera();
-        g_pfnClientEnterWorldPreview();
     }
 }
 

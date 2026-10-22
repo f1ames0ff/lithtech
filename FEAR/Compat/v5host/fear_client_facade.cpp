@@ -1,4 +1,5 @@
 #include "fear_client_facade.h"
+#include "iltmessage.h"
 #include "fear_host_api.h"
 #include "fear_renderer_stub.h"
 #include "fear_drawprim_stub.h"
@@ -95,8 +96,10 @@ static void Stub_GetListener_6(bool *bListenerInClient, LTVector *pPos, LTRotati
 
 static LTRESULT Stub_GetGameMode_7(int *mode)
 {
-    printf("STUB ILTClient::GetGameMode\n");
-    return StubDefault<LTRESULT>::Get();
+    if (!mode)
+        return LT_INVALIDPARAMS;
+    *mode = FearServerHost_IsRunning() ? STARTGAME_NORMAL : GAMEMODE_NONE;
+    return LT_OK;
 }
 
 bool g_bFearConnected = false;
@@ -1139,6 +1142,28 @@ LTDOUBLE CFearClient::GetServerRealTime()
 
 LTRESULT CFearClient::SendToServer(ILTMessage_Read *pMsg, uint32 flags)
 {
+    if (!pMsg || !FearServerHost_IsRunning())
+        return LT_ERROR;
+
+    uint32 nSaved = pMsg->Tell();
+    unsigned char nMessageID = (unsigned char)pMsg->ReadBits(8);
+    pMsg->SeekTo(nSaved);
+    printf("FEARPORT: client message id=%u", (unsigned)nMessageID);
+    pMsg->SeekTo(nSaved);
+    pMsg->ReadBits(8);
+    if (nMessageID == 160)
+        printf(" pause=%u", (unsigned)pMsg->ReadBits(1));
+    else if (nMessageID == 245)
+        printf(" state=%u", (unsigned)pMsg->ReadBits(8));
+    printf("\n");
+    fflush(stdout);
+    pMsg->SeekTo(nSaved);
+
+    ILTMessage_Read *pCopy = pMsg->Clone();
+    if (!pCopy)
+        return LT_ERROR;
+
+    FearServerHost_SubmitClientMessage(pCopy);
     return LT_OK;
 }
 
@@ -1168,7 +1193,9 @@ LTRESULT CFearClient::EndQuery()
 
 LTRESULT CFearClient::IsLocalToServer(bool *bLocal)
 {
-    return StubDefault<LTRESULT>::Get();
+    if (bLocal)
+        *bLocal = FearServerHost_IsRunning();
+    return (bLocal != NULL) ? LT_OK : LT_INVALIDPARAMS;
 }
 
 LTRESULT CFearClient::GetHostUDPSocket(SOCKET& socket)

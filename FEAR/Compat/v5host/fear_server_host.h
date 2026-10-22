@@ -9,9 +9,12 @@ extern "C" {
 
 bool FearServerHost_Start(const char *pszWorldName);
 void FearServerHost_Update(void);
+void FearServerHost_SubmitClientMessage(ILTMessage_Read *pMessage);
 void FearServerHost_DeliverMessages(void);
 void FearServerHost_Shutdown(void);
 bool FearServerHost_IsRunning(void);
+void *FearServerHost_GetClientHandle(void);
+void *FearServerHost_GetPlayerObject(void);
 
 typedef void (*TFearServerMessageSink)(ILTMessage_Read *pMessage);
 void FearServerHost_SetMessageSink(TFearServerMessageSink pSink);

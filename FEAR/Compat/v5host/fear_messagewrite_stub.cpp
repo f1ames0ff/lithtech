@@ -78,30 +78,56 @@ void CFearMessageWrite::WriteData(const void *pData, uint32 nSize)
 
 void CFearMessageWrite::WriteMessage(const ILTMessage_Read *pMsg)
 {
+    if (!pMsg)
+    {
+        WriteBits(0, 16);
+        return;
+    }
+    uint32 nSize = pMsg->Size();
+    WriteBits(nSize, 16);
+    WriteMessageRaw(pMsg);
 }
 
 void CFearMessageWrite::WriteMessageRaw(const ILTMessage_Read *pMsg)
 {
+    if (!pMsg)
+        return;
+    ILTMessage_Read *pRead = const_cast<ILTMessage_Read *>(pMsg);
+    uint32 nSaved = pRead->Tell();
+    pRead->SeekTo(0);
+    uint32 nRemaining = pMsg->Size();
+    while (nRemaining >= 32)
+    {
+        WriteBits(pRead->ReadBits(32), 32);
+        nRemaining -= 32;
+    }
+    if (nRemaining)
+        WriteBits(pRead->ReadBits(nRemaining), nRemaining);
+    pRead->SeekTo(nSaved);
 }
 
 void CFearMessageWrite::WriteString(const char *pString)
 {
     if (!pString)
         pString = "";
-
-    uint32 nLen = (uint32)strlen(pString);
-    WriteBits(nLen, 32);
-    WriteData(pString, nLen * 8);
+    while (*pString)
+    {
+        WriteBits((uint32)(uint8)*pString, 8);
+        ++pString;
+    }
+    WriteBits(0, 8);
 }
 
 void CFearMessageWrite::WriteWString(const wchar_t *pwString)
 {
     if (!pwString)
         pwString = L"";
-
-    uint32 nLen = (uint32)wcslen(pwString);
-    WriteBits(nLen, 32);
-    WriteData(pwString, nLen * (uint32)sizeof(wchar_t) * 8);
+    while (*pwString)
+    {
+        WriteBits((uint32)(uint16)*pwString, 16);
+        ++pwString;
+    }
+    WriteBits(0, 16);
 }
 
 void CFearMessageWrite::WriteCompLTVector(const LTVector &vVec)
@@ -126,7 +152,7 @@ void CFearMessageWrite::WriteCompLTRotation(const LTRotation &cRotation)
 
 void CFearMessageWrite::WriteObject(HOBJECT hObj)
 {
-    WriteBits64(reinterpret_cast<uint64>(hObj), 64);
+    WriteBits(hObj ? 0 : 0xFFFF, 16);
 }
 
 void CFearMessageWrite::WriteYRotation(const LTRotation &cRotation)

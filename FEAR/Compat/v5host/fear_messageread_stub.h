@@ -3,6 +3,7 @@
 
 #include "ltbasedefs.h"
 #include "iltmessage.h"
+#include <vector>
 
 class CFearMessageRead : public ILTMessage_Read
 {
@@ -49,9 +50,11 @@ public:
     LTRotation PeekYRotation() const override;
     HRECORD PeekDatabaseRecord(IDatabaseMgr *pDatabase, HCATEGORY hCategory) override;
 private:
+    CFearMessageRead *CreateFromBits(const uint8 *pData, uint32 nStart, uint32 nBits) const;
     const uint8 *m_pData = nullptr;
     uint32 m_nDataBits = 0;
     uint32 m_nReadPos = 0;
+    std::vector<uint8> m_Storage;
 };
 
 extern CFearMessageRead g_FearMessageRead;

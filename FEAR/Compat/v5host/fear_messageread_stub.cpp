@@ -1,221 +1,351 @@
 #include "fear_messageread_stub.h"
-#include <stdio.h>
-
-template <typename T> struct MsgDefault { static T Get() { return T(); } };
-template <> struct MsgDefault<LTRESULT> { static LTRESULT Get() { return LT_OK; } };
-template <> struct MsgDefault<const char*> { static const char* Get() { return ""; } };
+#include <string.h>
+#include <wchar.h>
 
 CFearMessageRead g_FearMessageRead;
 
 void CFearMessageRead::SetData(const uint8 *pData, uint32 nBits)
 {
-    m_pData = pData;
+    m_Storage.clear();
     m_nDataBits = nBits;
     m_nReadPos = 0;
+    if (!pData || nBits == 0)
+    {
+        m_pData = NULL;
+        return;
+    }
+
+    uint32 nBytes = (nBits + 7) >> 3;
+    m_Storage.assign(pData, pData + nBytes);
+    uint32 nRemainder = nBits & 7;
+    if (nRemainder)
+        m_Storage[nBytes - 1] &= (uint8)((1u << nRemainder) - 1u);
+    m_pData = m_Storage.data();
 }
 
-ILTMessage_Read * CFearMessageRead::Clone() const
+CFearMessageRead *CFearMessageRead::CreateFromBits(const uint8 *pData, uint32 nStart, uint32 nBits) const
 {
-    printf("STUB ILTMessage_Read::Clone\n");
-    return MsgDefault<ILTMessage_Read *>::Get();
+    CFearMessageRead *pResult = new CFearMessageRead;
+    if (!pData || nBits == 0)
+    {
+        pResult->SetData(NULL, 0);
+        return pResult;
+    }
+
+    std::vector<uint8> bits((nBits + 7) >> 3, 0);
+    for (uint32 i = 0; i < nBits; ++i)
+    {
+        uint32 nSource = nStart + i;
+        if (nSource >= m_nDataBits || (pData[nSource >> 3] & (1u << (nSource & 7))))
+            bits[i >> 3] |= (uint8)(1u << (i & 7));
+    }
+    pResult->SetData(bits.data(), nBits);
+    return pResult;
 }
 
-ILTMessage_Read * CFearMessageRead::SubMsg(uint32 nPos) const
+ILTMessage_Read *CFearMessageRead::Clone() const
 {
-    printf("STUB ILTMessage_Read::SubMsg\n");
-    return MsgDefault<ILTMessage_Read *>::Get();
+    return CreateFromBits(m_pData, 0, m_nDataBits);
 }
 
-ILTMessage_Read * CFearMessageRead::SubMsg(uint32 nPos, uint32 nLength) const
+ILTMessage_Read *CFearMessageRead::SubMsg(uint32 nPos) const
 {
-    printf("STUB ILTMessage_Read::SubMsg\n");
-    return MsgDefault<ILTMessage_Read *>::Get();
+    uint32 nStart = (nPos < m_nDataBits) ? nPos : m_nDataBits;
+    return CreateFromBits(m_pData, nStart, m_nDataBits - nStart);
+}
+
+ILTMessage_Read *CFearMessageRead::SubMsg(uint32 nPos, uint32 nLength) const
+{
+    uint32 nStart = (nPos < m_nDataBits) ? nPos : m_nDataBits;
+    uint32 nAvailable = m_nDataBits - nStart;
+    return CreateFromBits(m_pData, nStart, (nLength < nAvailable) ? nLength : nAvailable);
 }
 
 uint32 CFearMessageRead::Size() const
 {
-    printf("STUB ILTMessage_Read::Size\n");
-    return MsgDefault<uint32>::Get();
+    return m_nDataBits;
 }
 
 void CFearMessageRead::Seek(int32 nOffset)
 {
-    printf("STUB ILTMessage_Read::Seek\n");
+    int64 nPos = (int64)m_nReadPos + nOffset;
+    if (nPos < 0)
+        nPos = 0;
+    if (nPos > m_nDataBits)
+        nPos = m_nDataBits;
+    m_nReadPos = (uint32)nPos;
 }
 
 void CFearMessageRead::SeekTo(uint32 nPos)
 {
-    printf("STUB ILTMessage_Read::SeekTo\n");
+    m_nReadPos = (nPos < m_nDataBits) ? nPos : m_nDataBits;
 }
 
 uint32 CFearMessageRead::Tell() const
 {
-    printf("STUB ILTMessage_Read::Tell\n");
-    return MsgDefault<uint32>::Get();
+    return m_nReadPos;
 }
 
 uint32 CFearMessageRead::TellEnd() const
 {
-    printf("STUB ILTMessage_Read::TellEnd\n");
-    return MsgDefault<uint32>::Get();
+    return m_nDataBits - m_nReadPos;
 }
 
 bool CFearMessageRead::EOM() const
 {
-    printf("STUB ILTMessage_Read::EOM\n");
-    return MsgDefault<bool>::Get();
+    return m_nReadPos >= m_nDataBits;
 }
 
 uint32 CFearMessageRead::ReadBits(uint32 nBits)
 {
-    printf("STUB ILTMessage_Read::ReadBits\n");
-    return MsgDefault<uint32>::Get();
+    if (nBits > 32)
+        nBits = 32;
+    uint32 nValue = 0;
+    for (uint32 i = 0; i < nBits; ++i)
+    {
+        uint32 nPos = m_nReadPos + i;
+        if (nPos < m_nDataBits && m_pData && (m_pData[nPos >> 3] & (1u << (nPos & 7))))
+            nValue |= (1u << i);
+    }
+    m_nReadPos += nBits;
+    if (m_nReadPos > m_nDataBits)
+        m_nReadPos = m_nDataBits;
+    return nValue;
 }
 
 uint64 CFearMessageRead::ReadBits64(uint32 nBits)
 {
-    printf("STUB ILTMessage_Read::ReadBits64\n");
-    return MsgDefault<uint64>::Get();
+    if (nBits > 64)
+        nBits = 64;
+    uint64 nValue = 0;
+    for (uint32 i = 0; i < nBits; ++i)
+    {
+        uint32 nPos = m_nReadPos + i;
+        if (nPos < m_nDataBits && m_pData && (m_pData[nPos >> 3] & (1u << (nPos & 7))))
+            nValue |= ((uint64)1 << i);
+    }
+    m_nReadPos += nBits;
+    if (m_nReadPos > m_nDataBits)
+        m_nReadPos = m_nDataBits;
+    return nValue;
 }
 
 void CFearMessageRead::ReadData(void *pData, uint32 nBits)
 {
-    printf("STUB ILTMessage_Read::ReadData\n");
+    if (!pData)
+        return;
+    uint8 *pDest = (uint8 *)pData;
+    memset(pDest, 0, (nBits + 7) >> 3);
+    for (uint32 i = 0; i < nBits; ++i)
+    {
+        uint32 nPos = m_nReadPos + i;
+        if (nPos < m_nDataBits && m_pData && (m_pData[nPos >> 3] & (1u << (nPos & 7))))
+            pDest[i >> 3] |= (uint8)(1u << (i & 7));
+    }
+    m_nReadPos += nBits;
+    if (m_nReadPos > m_nDataBits)
+        m_nReadPos = m_nDataBits;
 }
 
-ILTMessage_Read * CFearMessageRead::ReadMessage()
+ILTMessage_Read *CFearMessageRead::ReadMessage()
 {
-    printf("STUB ILTMessage_Read::ReadMessage\n");
-    return MsgDefault<ILTMessage_Read *>::Get();
+    uint32 nSize = ReadBits(16);
+    ILTMessage_Read *pResult = SubMsg(m_nReadPos, nSize);
+    m_nReadPos += nSize;
+    if (m_nReadPos > m_nDataBits)
+        m_nReadPos = m_nDataBits;
+    return pResult;
 }
 
 uint32 CFearMessageRead::ReadString(char *pDest, uint32 nMaxLen)
 {
-    printf("STUB ILTMessage_Read::ReadString\n");
-    return MsgDefault<uint32>::Get();
+    uint32 nWritten = 0;
+    for (;;)
+    {
+        char c = (char)ReadBits(8);
+        if (pDest && nWritten + 1 < nMaxLen)
+            pDest[nWritten] = c;
+        if (c == 0)
+            break;
+        ++nWritten;
+        if (EOM())
+            break;
+    }
+    if (pDest && nMaxLen)
+        pDest[(nWritten < nMaxLen) ? nWritten : (nMaxLen - 1)] = 0;
+    return nWritten;
 }
 
 uint32 CFearMessageRead::ReadWString(wchar_t *pwDest, uint32 nMaxLen)
 {
-    printf("STUB ILTMessage_Read::ReadWString\n");
-    return MsgDefault<uint32>::Get();
+    uint32 nWritten = 0;
+    for (;;)
+    {
+        wchar_t c = (wchar_t)ReadBits(16);
+        if (pwDest && nWritten + 1 < nMaxLen)
+            pwDest[nWritten] = c;
+        if (c == 0)
+            break;
+        ++nWritten;
+        if (EOM())
+            break;
+    }
+    if (pwDest && nMaxLen)
+        pwDest[(nWritten < nMaxLen) ? nWritten : (nMaxLen - 1)] = 0;
+    return nWritten;
 }
 
 LTVector CFearMessageRead::ReadCompLTVector()
 {
-    printf("STUB ILTMessage_Read::ReadCompLTVector\n");
-    return MsgDefault<LTVector>::Get();
+    LTVector v;
+    uint32 nBits = ReadBits(32);
+    memcpy(&v.x, &nBits, sizeof(float));
+    nBits = ReadBits(32);
+    memcpy(&v.y, &nBits, sizeof(float));
+    nBits = ReadBits(32);
+    memcpy(&v.z, &nBits, sizeof(float));
+    return v;
 }
 
 LTVector CFearMessageRead::ReadCompPos()
 {
-    printf("STUB ILTMessage_Read::ReadCompPos\n");
-    return MsgDefault<LTVector>::Get();
+    return ReadCompLTVector();
 }
 
 LTRotation CFearMessageRead::ReadCompLTRotation()
 {
-    printf("STUB ILTMessage_Read::ReadCompLTRotation\n");
-    return MsgDefault<LTRotation>::Get();
+    LTRotation r;
+    for (int i = 0; i < 4; ++i)
+    {
+        uint32 nBits = ReadBits(32);
+        memcpy(&r.m_Quat[i], &nBits, sizeof(float));
+    }
+    return r;
 }
 
 HOBJECT CFearMessageRead::ReadObject()
 {
-    printf("STUB ILTMessage_Read::ReadObject\n");
-    return MsgDefault<HOBJECT>::Get();
+    uint32 nID = ReadBits(16);
+    return (nID == 0xFFFF) ? NULL : (HOBJECT)(uintptr_t)nID;
 }
 
 LTRotation CFearMessageRead::ReadYRotation()
 {
-    printf("STUB ILTMessage_Read::ReadYRotation\n");
-    return MsgDefault<LTRotation>::Get();
+    return ReadCompLTRotation();
 }
 
-HRECORD CFearMessageRead::ReadDatabaseRecord(IDatabaseMgr *pDatabase, HCATEGORY hCategory)
+HRECORD CFearMessageRead::ReadDatabaseRecord(IDatabaseMgr *, HCATEGORY)
 {
-    printf("STUB ILTMessage_Read::ReadDatabaseRecord\n");
-    return MsgDefault<HRECORD>::Get();
+    return (HRECORD)(uintptr_t)ReadBits(16);
 }
 
 LTPolarCoord CFearMessageRead::ReadCompLTPolarCoord()
 {
-    printf("STUB ILTMessage_Read::ReadCompLTPolarCoord\n");
-    return MsgDefault<LTPolarCoord>::Get();
+    LTPolarCoord p;
+    memset(&p, 0, sizeof(p));
+    ReadData(&p, sizeof(p) * 8);
+    return p;
 }
 
 HENGINETIMER CFearMessageRead::ReadTimer()
 {
-    printf("STUB ILTMessage_Read::ReadTimer\n");
-    return MsgDefault<HENGINETIMER>::Get();
+    return (HENGINETIMER)(uintptr_t)ReadBits(16);
 }
 
 uint32 CFearMessageRead::PeekBits(uint32 nBits) const
 {
-    printf("STUB ILTMessage_Read::PeekBits\n");
-    return MsgDefault<uint32>::Get();
+    CFearMessageRead *pSelf = const_cast<CFearMessageRead *>(this);
+    uint32 nSaved = pSelf->m_nReadPos;
+    uint32 nValue = pSelf->ReadBits(nBits);
+    pSelf->m_nReadPos = nSaved;
+    return nValue;
 }
 
 uint64 CFearMessageRead::PeekBits64(uint32 nBits) const
 {
-    printf("STUB ILTMessage_Read::PeekBits64\n");
-    return MsgDefault<uint64>::Get();
+    CFearMessageRead *pSelf = const_cast<CFearMessageRead *>(this);
+    uint32 nSaved = pSelf->m_nReadPos;
+    uint64 nValue = pSelf->ReadBits64(nBits);
+    pSelf->m_nReadPos = nSaved;
+    return nValue;
 }
 
 void CFearMessageRead::PeekData(void *pData, uint32 nBits) const
 {
-    printf("STUB ILTMessage_Read::PeekData\n");
+    CFearMessageRead *pSelf = const_cast<CFearMessageRead *>(this);
+    uint32 nSaved = pSelf->m_nReadPos;
+    pSelf->ReadData(pData, nBits);
+    pSelf->m_nReadPos = nSaved;
 }
 
-ILTMessage_Read * CFearMessageRead::PeekMessage() const
+ILTMessage_Read *CFearMessageRead::PeekMessage() const
 {
-    printf("STUB ILTMessage_Read::PeekMessage\n");
-    return MsgDefault<ILTMessage_Read *>::Get();
+    CFearMessageRead *pSelf = const_cast<CFearMessageRead *>(this);
+    uint32 nSaved = pSelf->m_nReadPos;
+    ILTMessage_Read *pResult = pSelf->ReadMessage();
+    pSelf->m_nReadPos = nSaved;
+    return pResult;
 }
 
 uint32 CFearMessageRead::PeekString(char *pDest, uint32 nMaxLen) const
 {
-    printf("STUB ILTMessage_Read::PeekString\n");
-    return MsgDefault<uint32>::Get();
+    CFearMessageRead *pSelf = const_cast<CFearMessageRead *>(this);
+    uint32 nSaved = pSelf->m_nReadPos;
+    uint32 nResult = pSelf->ReadString(pDest, nMaxLen);
+    pSelf->m_nReadPos = nSaved;
+    return nResult;
 }
 
 uint32 CFearMessageRead::PeekWString(wchar_t *pwDest, uint32 nMaxLen) const
 {
-    printf("STUB ILTMessage_Read::PeekWString\n");
-    return MsgDefault<uint32>::Get();
+    CFearMessageRead *pSelf = const_cast<CFearMessageRead *>(this);
+    uint32 nSaved = pSelf->m_nReadPos;
+    uint32 nResult = pSelf->ReadWString(pwDest, nMaxLen);
+    pSelf->m_nReadPos = nSaved;
+    return nResult;
 }
 
 LTVector CFearMessageRead::PeekCompLTVector() const
 {
-    printf("STUB ILTMessage_Read::PeekCompLTVector\n");
-    return MsgDefault<LTVector>::Get();
+    CFearMessageRead *pSelf = const_cast<CFearMessageRead *>(this);
+    uint32 nSaved = pSelf->m_nReadPos;
+    LTVector v = pSelf->ReadCompLTVector();
+    pSelf->m_nReadPos = nSaved;
+    return v;
 }
 
 LTVector CFearMessageRead::PeekCompPos() const
 {
-    printf("STUB ILTMessage_Read::PeekCompPos\n");
-    return MsgDefault<LTVector>::Get();
+    return PeekCompLTVector();
 }
 
 LTRotation CFearMessageRead::PeekCompLTRotation() const
 {
-    printf("STUB ILTMessage_Read::PeekCompLTRotation\n");
-    return MsgDefault<LTRotation>::Get();
+    CFearMessageRead *pSelf = const_cast<CFearMessageRead *>(this);
+    uint32 nSaved = pSelf->m_nReadPos;
+    LTRotation r = pSelf->ReadCompLTRotation();
+    pSelf->m_nReadPos = nSaved;
+    return r;
 }
 
 HOBJECT CFearMessageRead::PeekObject() const
 {
-    printf("STUB ILTMessage_Read::PeekObject\n");
-    return MsgDefault<HOBJECT>::Get();
+    CFearMessageRead *pSelf = const_cast<CFearMessageRead *>(this);
+    uint32 nSaved = pSelf->m_nReadPos;
+    HOBJECT hObj = pSelf->ReadObject();
+    pSelf->m_nReadPos = nSaved;
+    return hObj;
 }
 
 LTRotation CFearMessageRead::PeekYRotation() const
 {
-    printf("STUB ILTMessage_Read::PeekYRotation\n");
-    return MsgDefault<LTRotation>::Get();
+    return PeekCompLTRotation();
 }
 
 HRECORD CFearMessageRead::PeekDatabaseRecord(IDatabaseMgr *pDatabase, HCATEGORY hCategory)
 {
-    printf("STUB ILTMessage_Read::PeekDatabaseRecord\n");
-    return MsgDefault<HRECORD>::Get();
+    uint32 nSaved = m_nReadPos;
+    HRECORD hRecord = ReadDatabaseRecord(pDatabase, hCategory);
+    m_nReadPos = nSaved;
+    return hRecord;
 }

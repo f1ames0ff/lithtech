@@ -808,3 +808,66 @@ Remaining work for the next iteration:
   without modifying a retail DLL.
 - Keep the retail `EngineServer.dll`/`GameServer.dll` path clearly marked as a bootstrap; the
   final port must not depend on stub-only `ObjectDLLSetup` classes.
+
+### Iteration 8 - v5 client/server session and first mission state
+
+The retail v5 server is now driven as a real in-process session rather than a
+synthetic callback probe.
+
+- `FearServerHost_Start` creates the server and loads the binaries without
+  starting a world. `StartGame` only starts the session; the client's
+  `MID_START_LEVEL` (185) is what makes `ServerMissionMgr` load
+  `Worlds\Release\Intro`.
+- The server client is a real-shaped 0x60-byte engine client record with
+  `GetClientID` (cdecl), `GetClientName`, `SetClientName`, and
+  `FinishClientConnect` left intact. Only `SendToClient` (vtable 94) and
+  `GetClientAddr` (vtable 105) are replaced.
+- After the world-loaded notification, the host calls `sub_10041750` to create
+  the player through the engine's normal `OnClientEnterWorld` path and stores
+  the returned object in the client record's `+0x5C` field.
+- Client messages are deep-copied into a stable read object and pumped through
+  `IServerShell::OnMessage` (slot 10). Server messages are deep-copied before
+  delivery so the retail auto-message buffer cannot be reused under the client.
+- `ILTClient::GetGameMode` now reports `STARTGAME_NORMAL` while the server is
+  running. This was required for `PostScreenState` to allow the transition from
+  the postload screen to `GS_PLAYING`.
+- The client sends `MID_CLIENTCONNECTION` Loading and InWorld, receives player
+  state messages, and reaches `GS_PLAYING` with `recv=12`, `sent=12`, player
+  state `ePlayerState_Alive`, and `GetCurrentWorldName()` equal to
+  `Worlds\Release\Intro`.
+- A save-data request during the level switch is answered by the client bridge
+  instead of being handed to the unimplemented client save path.
+- The postload screen is continued with a synthetic space key when it is
+  visible, which lets the auto-start session reach the playing state.
+
+Verified run (Debug, 20 seconds, no crash):
+
+```
+FEARSERVER: Loading world: Worlds\Release\Intro
+FEARSERVER: World loaded.
+FEARSERVER: player connected=...
+FEARPORT: PlayerStateChange value=5
+FEARPORT: PlayerStateChange value=1
+FEARPORT: ChangeState 6 -> 1 screen=39
+FEARPORT: clientstate game=1 recv=12 sent=12 player=1 world='Worlds\Release\Intro'
+```
+
+The native D3D9 renderer on this machine currently returns
+`D3DERR_DEVICELOST` from `CreateDevice` even for a reference device, so the
+verified run above uses DXVK 2.7.1 `d3d9.dll` in the staging directory only.
+DXVK is a local test workaround, not a repository dependency and not part of
+the final runtime.
+
+Remaining blockers for the stated goal:
+
+- The renderer is still the flat v113 preview. The player camera and a real
+  v5 `RenderCamera` path are not yet wired, so the visible frame is not the
+  retail mission frame.
+- HUD/weapon/object-dependent messages (103, 126, 129, 145, 212, 231, 229,
+  233, 230, 138) are filtered until database records and server object handles
+  are mapped to the client. Movement, collision, weapons and HUD therefore do
+  not yet work.
+- `ILTModel`, `ILTCustomRender`, material instances, `.Mat00`/`.fxo`, DDS mip
+  chains, lights and shadows are still the next renderer milestone.
+- The `IsMultiplayerExe` and internal EngineServer offsets remain a retail
+  bootstrap dependency until the source-side server is implemented.
