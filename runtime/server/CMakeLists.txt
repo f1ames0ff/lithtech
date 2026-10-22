@@ -169,7 +169,7 @@ if(ENABLE_D3D)
 endif(ENABLE_D3D)
 
 if(ENABLE_DIRECTX)	# FIXME: set to find DirectX path
-	include_directories("C:\\Program Files (x86)\\Microsoft DirectX SDK (August 2007)\\Include")
+	include_directories("${DXSDK_INCLUDE_DIR}")
 endif(ENABLE_DIRECTX)
 
 add_library(${PROJECT_NAME} SHARED ${libsources})
@@ -179,6 +179,7 @@ set_target_properties(${PROJECT_NAME}
 
 target_link_libraries(${PROJECT_NAME}
 	LIB_RezMgr
+	LIB_LTar
 	LIB_Info
 	LIB_Lith
 	LIB_StdLith

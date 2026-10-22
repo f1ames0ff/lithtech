@@ -2,9 +2,9 @@ project(DLL_SndDrvDX8)
 
 if(WIN32)
 if(CMAKE_CL_64)
-	link_directories("C:\\Program Files (x86)\\Microsoft DirectX SDK (August 2007)\\Lib\\x64")
+	link_directories("${DXSDK_LIB_DIR}")
 else(CMAKE_CL_64)
-	link_directories("C:\\Program Files (x86)\\Microsoft DirectX SDK (August 2007)\\Lib\\x86")
+	link_directories("${DXSDK_LIB_DIR}")
 endif(CMAKE_CL_64)
 
 add_library(${PROJECT_NAME} SHARED
@@ -28,6 +28,6 @@ target_link_libraries(${PROJECT_NAME}
 	LIB_LTMem)
 
 if(NOT CMAKE_CL_64)
-	target_link_libraries(${PROJECT_NAME} eaxguid)
+	target_link_libraries(${PROJECT_NAME} "${CMAKE_CURRENT_SOURCE_DIR}/eaxguid.lib")
 endif(NOT CMAKE_CL_64)
 endif(WIN32)

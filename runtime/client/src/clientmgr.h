@@ -100,7 +100,7 @@ SMusicMgr *GetMusicMgr();
 
 #define MAX_DLLNAME_LEN         255
 #define MAX_CLIENTNAME_LEN      200
-#define MAX_RESTREES            20
+#define MAX_RESTREES            48
 
 
 #define MAX_CLIENTERRORSTRING_LEN   300

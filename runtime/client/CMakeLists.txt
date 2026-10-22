@@ -3,9 +3,9 @@ project(EXE_Lithtech)
 add_definitions(-DDE_LOCAL_SERVERBIND -DDE_CLIENT_COMPILE -DDSNDMGR_NO_MFC -DDIRECTENGINE_COMPILE -DMODEL_SUPPORT_ABC)
 if(WIN32)
 if(CMAKE_CL_64)
-	link_directories("C:\\Program Files (x86)\\Microsoft DirectX SDK (August 2007)\\Lib\\x64")
+	link_directories("${DXSDK_LIB_DIR}")
 else(CMAKE_CL_64)
-	link_directories("C:\\Program Files (x86)\\Microsoft DirectX SDK (August 2007)\\Lib\\x86")
+	link_directories("${DXSDK_LIB_DIR}")
 endif(CMAKE_CL_64)
 endif(WIN32)
 
@@ -163,7 +163,6 @@ if(WIN32)
 	../kernel/src/sys/win/counter.cpp
 	src/sys/win/customfontfilemgr.cpp
 	../kernel/mem/src/sys/win/de_memory.cpp
-	../kernel/src/sys/win/dshowvideomgrimpl.cpp
 	../shared/src/sys/win/dstreamopenqueuemgr.cpp
 	../kernel/src/sys/win/dsys_interface.cpp
 	../kernel/src/sys/win/dutil.cpp
@@ -257,9 +256,12 @@ if(WIN32)
 	include_directories(../kernel/src/sys/win
 		../shared/src/sys/win)
 	set(libs ${libs}
-		LIB_DShow
 		LIB_D3DRender
 		winmm)
+	if(ENABLE_DIRECTSHOW)
+		set(libs ${libs} LIB_DShow)
+		set(exec_src ${exec_src} ../kernel/src/sys/win/dshowvideomgrimpl.cpp)
+	endif(ENABLE_DIRECTSHOW)
 else(WIN32)
 	find_package(SDL2 REQUIRED)
 
@@ -275,7 +277,7 @@ endif(WIN32)
 
 if(ENABLE_DIRECTX)	# FIXME: set to find DirectX path
 	include_directories(../../libs/dshow
-		"C:\\Program Files (x86)\\Microsoft DirectX SDK (August 2007)\\Include")
+		"${DXSDK_INCLUDE_DIR}")
 		#if(CMAKE_CL_64)
 		#	link_directories("C:\\Program Files (x86)\\Microsoft DirectX SDK (August 2007)\\Lib\\x64")
 		#else(CMAKE_CL_64)
@@ -288,7 +290,7 @@ if(ENABLE_DIRECTX)	# FIXME: set to find DirectX path
 			ddraw
 			d3dx9
 			d3d9
-			DxErr9
+			DxErr
 			dxguid
 			dplayx
 			dinput8
@@ -300,6 +302,7 @@ set(libs ${libs}
 	LIB_ZLib
 	LIB_LTMem
 	LIB_RezMgr
+	LIB_LTar
 	LIB_Lith
 	LIB_Info
 	LIB_ILTSound

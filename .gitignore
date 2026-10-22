@@ -1,5 +1,11 @@
 [Bb]uild
+build*/
+run/
+run*/
+cmake-build-*/
 Rez
 *.REZ
 .vscode
+.idea/
+opencode.jsonc
 codeblocks

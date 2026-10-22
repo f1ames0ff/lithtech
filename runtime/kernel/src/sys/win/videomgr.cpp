@@ -3,7 +3,9 @@
 #include "videomgr.h"
 
 #include "binkvideomgrimpl.h"
+#ifdef __ENABLE_DIRECTSHOW
 #include "dshowvideomgrimpl.h"
+#endif
 
 extern int32 g_CV_VideoDebug;
 
@@ -103,6 +105,7 @@ VideoMgr* CreateVideoMgr( const char *pszName )
 	}
 	else if ( want_dshow )
 	{
+#ifdef __ENABLE_DIRECTSHOW
 		VideoMgr* pVidMgr;
 
 		LT_MEM_TRACK_ALLOC(pVidMgr = new DShowVideoMgr(),LT_MEM_TYPE_MISC);
@@ -120,7 +123,7 @@ VideoMgr* CreateVideoMgr( const char *pszName )
 			pVidMgr = NULL;
 		}
 
-
+#endif
 	}
 
   

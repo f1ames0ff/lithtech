@@ -17,10 +17,10 @@
 
 // This is a redirector to get the system dependent include
 #ifdef __LINUX
-#define MAX_FILETREES_TO_SEARCH		(32)
+#define MAX_FILETREES_TO_SEARCH		(64)
 #include "sys/linux/linuxfile.h"
 #elif _WIN32
-#define MAX_FILETREES_TO_SEARCH		(32)
+#define MAX_FILETREES_TO_SEARCH		(64)
 #include "sys/win/de_file.h"
 #endif
 

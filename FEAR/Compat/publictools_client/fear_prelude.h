@@ -1,0 +1,11 @@
+#pragma once
+#define WIN32_LEAN_AND_MEAN
+#include <windows.h>
+#include <mmsystem.h>
+#include <ctype.h>
+#include <string>
+#include <algorithm>
+#include <vector>
+#include <map>
+#include <list>
+#include <memory>

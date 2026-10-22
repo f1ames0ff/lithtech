@@ -1,0 +1,16 @@
+project(LIB_LTar)
+
+add_library(${PROJECT_NAME} STATIC
+	ltar.cpp)
+
+target_include_directories(${PROJECT_NAME} PUBLIC
+	${CMAKE_CURRENT_SOURCE_DIR})
+
+set_target_properties(${PROJECT_NAME} PROPERTIES
+	CXX_STANDARD 17
+	CXX_STANDARD_REQUIRED ON
+	CXX_EXTENSIONS OFF)
+
+if(LINUX)
+	set_target_properties(${PROJECT_NAME} PROPERTIES POSITION_INDEPENDENT_CODE ON)
+endif(LINUX)

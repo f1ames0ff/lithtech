@@ -267,7 +267,7 @@ LTRESULT GetOrCopyFile( char const* pszFilename,
 
     // Get the temp path.
 	char szTempPath[MAX_PATH*2] = "";
-    if( !GetTempPath( sizeof( szTempPath ), szTempPath )) 
+    if( !GetTempPath( sizeof( szTempPath ), szTempPath ))
 		{
         strcpy( szTempPath, ".\\" );
         }
@@ -352,6 +352,56 @@ void dsi_ServerSleep(uint32 ms) {
         Sleep(ms);
     }
 }
+
+LTRESULT GetOrCopyClientFile( char const* pszFilename,
+							 char* pszOutName, int outNameLen, bool& bFileCopied )
+{
+    FileIdentifier *pIdent;
+    FileRef ref;
+    LTRESULT dResult;
+
+	bFileCopied = false;
+    ref.m_FileType = FILE_ANYFILE;
+    ref.m_pFilename = pszFilename;
+    pIdent = client_file_mgr->GetFileIdentifier(&ref, TYPECODE_DLL);
+    if (pIdent && ((df_GetTreeType(pIdent->m_hFileTree) == DosTree)))
+	{
+        int status = df_GetFullFilename(pIdent->m_hFileTree, ( char* )pszFilename, pszOutName, outNameLen);
+        ASSERT(status != 0);
+        return LT_OK;
+    }
+
+    // Get the temp path.
+	char szTempPath[MAX_PATH*2] = "";
+    if( !GetTempPath( sizeof( szTempPath ), szTempPath ))
+		{
+        strcpy( szTempPath, ".\\" );
+        }
+
+	// Get a temp filename.
+    char szTempFilename[MAX_PATH*2] = "";
+	if( !GetTempFileName( szTempPath, pszFilename, 0, szTempFilename ))
+				{
+		strcpy( szTempFilename, pszFilename );
+                }
+
+	// Copy the file.
+    dResult = client_file_mgr->CopyFile( pszFilename, szTempFilename );
+    if( dResult != LT_OK )
+				{
+					dResult = CopyFileA(pszFilename, szTempFilename, 0);
+					if (dResult == 0)
+					{
+						return dResult;
+					}
+                }
+
+	bFileCopied = true;
+    LTStrCpy( pszOutName, szTempFilename, outNameLen );
+
+    return LT_OK;
+            }
+
 
 #ifdef DE_CLIENT_COMPILE
 #include "clientmgr.h"
@@ -453,55 +503,6 @@ LTRESULT dsi_ShutdownRender(uint32 flags) {
     return LT_OK;
 }
 
-
-LTRESULT GetOrCopyClientFile( char const* pszFilename, 
-							 char* pszOutName, int outNameLen, bool& bFileCopied ) 
-{
-    FileIdentifier *pIdent;
-    FileRef ref;
-    LTRESULT dResult;
-
-	bFileCopied = false;
-    ref.m_FileType = FILE_ANYFILE;
-    ref.m_pFilename = pszFilename;
-    pIdent = client_file_mgr->GetFileIdentifier(&ref, TYPECODE_DLL);
-    if (pIdent && ((df_GetTreeType(pIdent->m_hFileTree) == DosTree))) 
-	{
-        int status = df_GetFullFilename(pIdent->m_hFileTree, ( char* )pszFilename, pszOutName, outNameLen);
-        ASSERT(status != 0);
-        return LT_OK;
-    }
-
-    // Get the temp path.
-	char szTempPath[MAX_PATH*2] = "";
-    if( !GetTempPath( sizeof( szTempPath ), szTempPath )) 
-		{
-        strcpy( szTempPath, ".\\" );
-        }
-
-	// Get a temp filename.
-    char szTempFilename[MAX_PATH*2] = "";
-	if( !GetTempFileName( szTempPath, pszFilename, 0, szTempFilename ))
-				{
-		strcpy( szTempFilename, pszFilename );
-                }
-
-	// Copy the file.
-    dResult = client_file_mgr->CopyFile( pszFilename, szTempFilename );
-    if( dResult != LT_OK )
-				{
-					dResult = CopyFileA(pszFilename, szTempFilename, 0);
-					if (dResult == 0)
-					{
-						return dResult;
-					}
-                }
-
-	bFileCopied = true;
-    LTStrCpy( pszOutName, szTempFilename, outNameLen );
-
-    return LT_OK;
-            }
 
 
 

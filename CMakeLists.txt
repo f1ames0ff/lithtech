@@ -1,5 +1,7 @@
-cmake_minimum_required(VERSION 3.1)
+cmake_minimum_required(VERSION 3.10)
 project(Lithtech)
+
+list(APPEND CMAKE_MODULE_PATH "${CMAKE_CURRENT_SOURCE_DIR}/cmake")
 
 option(BUILD_ENGINE "Build engine" ON)
 option(BUILD_NOLF2 "Build No One Lives Forever 2 game code" ON)
@@ -9,6 +11,10 @@ option(BUILD_FEAR "Build F.E.A.R. game code" OFF)
 option(BUILD_NOLF "Build No One Lives Forever game code" OFF)
 option(BUILD_SHOGO "Build Shogo game code" OFF)
 option(BUILD_TOOLS "Build tools" OFF)
+option(BUILD_FEAR_PORT "Build the F.E.A.R. port" OFF)
+option(BUILD_LTAR_TOOLS "Build ltar tools and tests" ON)
+set(FEAR_SDK_DIR "" CACHE PATH "F.E.A.R. SDK root containing engine/sdk/inc")
+set(FEAR_RETAIL_DIR "" CACHE PATH "F.E.A.R. retail installation root")
 if(WIN32)
 option(ENABLE_D3D "Enable Direct3D" ON)
 option(ENABLE_DIRECTX "Enable DirectX" ON)
@@ -20,8 +26,15 @@ endif(WIN32)
 option(USE_INTERNAL_ZLIB "Use bundled zlib" ON)			# eventually want default to be OFF
 option(USE_INTERNAL_FREETYPE "Use bundled freetype" ON)	# eventually want default to be OFF
 
+if(BUILD_FEAR_PORT)
+    set(BUILD_NOLF2 OFF)
+    set(BUILD_FEAR OFF)
+endif(BUILD_FEAR_PORT)
 
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/OUT")
+if(BUILD_FEAR_PORT)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/OUT_FEAR")
+endif(BUILD_FEAR_PORT)
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED 17)
 
@@ -39,13 +52,51 @@ endif(WIN32)
 
 if(MSVC)
     add_definitions(-D_CRT_SECURE_NO_WARNINGS -D_CRT_NONSTDC_NO_DEPRECATE)
+    if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+        add_definitions(-D_AMD64_)
+    else()
+        add_definitions(-D_X86_)
+    endif()
 endif(MSVC)
+
+if(WIN32)
+    if(NOT DXSDK_DIR)
+        if(DEFINED ENV{DXSDK_DIR})
+            set(DXSDK_DIR "$ENV{DXSDK_DIR}")
+        elseif(EXISTS "C:/Program Files (x86)/Microsoft DirectX SDK (June 2010)")
+            set(DXSDK_DIR "C:/Program Files (x86)/Microsoft DirectX SDK (June 2010)")
+        elseif(EXISTS "C:/Program Files (x86)/Microsoft DirectX SDK (August 2007)")
+            set(DXSDK_DIR "C:/Program Files (x86)/Microsoft DirectX SDK (August 2007)")
+        endif()
+    endif()
+    if(DXSDK_DIR)
+        file(TO_CMAKE_PATH "${DXSDK_DIR}" DXSDK_DIR)
+        set(DXSDK_INCLUDE_DIR "${DXSDK_DIR}/Include")
+        if(CMAKE_SIZEOF_VOID_P EQUAL 8)
+            set(DXSDK_LIB_DIR "${DXSDK_DIR}/Lib/x64")
+        else()
+            set(DXSDK_LIB_DIR "${DXSDK_DIR}/Lib/x86")
+        endif()
+    else()
+        message(FATAL_ERROR "DirectX SDK not found. Set DXSDK_DIR to the DirectX SDK root (for example C:/tools/dxsdk_jun10).")
+    endif()
+endif(WIN32)
+
+if(ENABLE_DIRECTSHOW)
+    add_definitions(-D__ENABLE_DIRECTSHOW)
+endif(ENABLE_DIRECTSHOW)
 
 if(DEBUG)
     add_definitions(-D_DEBUG)
 else(DEBUG)
     add_definitions(-D_FINAL)
 endif(DEBUG)
+
+if(WIN32)
+    find_package(SDL2 REQUIRED)
+    include_directories(${SDL2_INCLUDE_DIRS})
+    link_directories(${SDL2_LIBRARY_DIRS})
+endif(WIN32)
 
 
 if(USE_INTERNAL_ZLIB)
@@ -67,6 +118,7 @@ add_subdirectory(libs/lith)								# LIB_Lith
 add_subdirectory(libs/stdlith)							# LIB_StdLith
 add_subdirectory(libs/ltmem)							# LIB_LTMem
 add_subdirectory(libs/rezmgr)							# LIB_RezMgr
+add_subdirectory(libs/ltar)
 
 if(LINUX)
     set(JSON_BuildTests off)
@@ -130,6 +182,10 @@ if(BUILD_FEAR)
 #	add_subdirectory(NOLF2/ServerRes/TO2)				# ServerRes
 endif(BUILD_FEAR)
 
+if(BUILD_FEAR_PORT)
+    add_subdirectory(FEAR)
+endif(BUILD_FEAR_PORT)
+
 if(BUILD_TRON)
     if(NOT BUILD_NOLF2)
         add_subdirectory(libs/MFCStub)
@@ -152,7 +208,20 @@ if(BUILD_TOOLS)
     add_subdirectory(tools/LithRez)			# TOOLS_LithRez
 endif(BUILD_TOOLS)
 
-add_subdirectory(tests/RegMgr)
-add_subdirectory(tests/CShell)
-add_subdirectory(tests/DynRes)
-add_subdirectory(tests/DynResDLL)
+if(BUILD_FEAR_PORT OR BUILD_LTAR_TOOLS)
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tools/ltar_dump/CMakeLists.txt")
+        add_subdirectory(tools/ltar_dump)
+    endif()
+    if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/ltar/CMakeLists.txt")
+        add_subdirectory(tests/ltar)
+    endif()
+endif(BUILD_FEAR_PORT OR BUILD_LTAR_TOOLS)
+
+if(BUILD_NOLF2 OR BUILD_FEAR)
+    add_subdirectory(tests/RegMgr)
+endif(BUILD_NOLF2 OR BUILD_FEAR)
+if(LINUX)
+    add_subdirectory(tests/CShell)
+    add_subdirectory(tests/DynRes)
+    add_subdirectory(tests/DynResDLL)
+endif(LINUX)

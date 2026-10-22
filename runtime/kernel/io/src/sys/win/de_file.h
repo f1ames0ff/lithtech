@@ -24,7 +24,8 @@ typedef void* HLTFileTree;  // A file tree identifier.
 enum TreeType
 {
 	RezFileTree,
-	DosTree
+	DosTree,
+	LtarFileTree
 };
 
 

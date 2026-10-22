@@ -72,10 +72,108 @@ typedef int (*GetLithtechCommandLineFn)(int32 argc, char **argv,
 
 ClientGlob g_ClientGlob;
 uint32 g_EngineStartMS;
+bool g_bFearMode = false;
 
 
 ///////////////////////////////////////////////////
 //  Functions.
+
+static char g_ArchCfgNames[MAX_RESTREES][_MAX_PATH + 1];
+static uint32 g_nArchCfgNames = 0;
+
+
+static char *TrimArchiveConfigLine(char *pszLine)
+{
+    while(*pszLine && isspace((unsigned char)*pszLine))
+        ++pszLine;
+
+    char *pszEnd = pszLine + strlen(pszLine);
+    while(pszEnd > pszLine && isspace((unsigned char)pszEnd[-1]))
+        --pszEnd;
+
+    *pszEnd = '\0';
+    return pszLine;
+}
+
+
+static void AddResourceTree(const char **pResTrees, uint32 &nResTrees, const char *pszName)
+{
+    if(!pszName || !pszName[0])
+    {
+        dsi_ConsolePrint("Ignoring an empty resource tree name.");
+        return;
+    }
+
+    if(nResTrees >= MAX_RESTREES)
+    {
+        dsi_ConsolePrint("Too many resource trees, ignoring %s.", pszName);
+        return;
+    }
+
+    pResTrees[nResTrees++] = pszName;
+}
+
+
+static void LoadArchiveConfig(const char *pszFilename, const char **pResTrees, uint32 &nResTrees)
+{
+    if(!pszFilename || !pszFilename[0])
+    {
+        dsi_ConsolePrint("No archive configuration file was specified.");
+        return;
+    }
+
+    FILE *pFile = fopen(pszFilename, "rt");
+    if(!pFile)
+    {
+        dsi_ConsolePrint("Unable to open the archive configuration file %s.", pszFilename);
+        return;
+    }
+
+    uint32 nLine = 0;
+    uint32 nLoaded = 0;
+    char szLine[_MAX_PATH + 1];
+
+    while(fgets(szLine, sizeof(szLine), pFile))
+    {
+        ++nLine;
+
+        if(!strchr(szLine, '\n') && !feof(pFile))
+        {
+            int ch;
+            while((ch = fgetc(pFile)) != EOF && ch != '\n')
+            {
+            }
+
+            dsi_ConsolePrint("Archive configuration %s line %u is too long, skipping it.", pszFilename, nLine);
+            continue;
+        }
+
+        char *pszComment = strchr(szLine, ';');
+        if(pszComment)
+            *pszComment = '\0';
+
+        char *pszName = TrimArchiveConfigLine(szLine);
+        if(!pszName[0])
+            continue;
+
+        if(g_nArchCfgNames >= MAX_RESTREES)
+        {
+            dsi_ConsolePrint("Archive configuration %s has more than %u entries, stopping at line %u.",
+                pszFilename, (uint32)MAX_RESTREES, nLine);
+            break;
+        }
+
+        LTStrCpy(g_ArchCfgNames[g_nArchCfgNames], pszName, sizeof(g_ArchCfgNames[0]));
+        AddResourceTree(pResTrees, nResTrees, g_ArchCfgNames[g_nArchCfgNames]);
+        ++g_nArchCfgNames;
+        ++nLoaded;
+    }
+
+    fclose(pFile);
+
+    dsi_ConsolePrint("Loaded %u archive names from %s.", nLoaded, pszFilename);
+}
+
 
 static bool StartClient(ClientGlob *pGlob) 
 {
@@ -92,27 +190,51 @@ static bool StartClient(ClientGlob *pGlob)
 
     // Find all the res trees.
     nResTrees = 0;
-#if 0
-    for (uint32 i = 0; i < command_line_args->Argc() - 1; i++) {
-        //check if this argument is -rez
-        if (stricmp(command_line_args->Argv(i), "-rez") == 0) {
-            //save this parameter.
-            resTrees[nResTrees++] = command_line_args->Argv(i + 1);
-            if (nResTrees+1 >= MAX_RESTREES) {
-                break;
-            }
-        }
-    }
-#endif
-    // Add the default engine resource...
-    if (!g_CV_NoDefaultEngineRez) 
-	{
-        resTrees[nResTrees++] = "engine.rez"; 
+    g_nArchCfgNames = 0;
+
+    g_bFearMode = command_line_args->FindArgDash("fear") != NULL;
+    if (g_bFearMode) {
+        dsi_ConsolePrint("F.E.A.R. mode enabled (-fear).");
     }
 
-	resTrees[nResTrees++] = "game.rez";
-	resTrees[nResTrees++] = "game2.rez";
-	resTrees[nResTrees++] = "sound.rez";
+    for (uint32 i = 0; i + 1 < command_line_args->Argc(); i++) {
+        if (stricmp(command_line_args->Argv(i), "-rez") == 0) {
+            AddResourceTree(resTrees, nResTrees, command_line_args->Argv(i + 1));
+        }
+    }
+
+    if (!g_bFearMode) {
+        if (!g_CV_NoDefaultEngineRez)
+        {
+            AddResourceTree(resTrees, nResTrees, "engine.rez");
+        }
+
+        AddResourceTree(resTrees, nResTrees, "game.rez");
+        AddResourceTree(resTrees, nResTrees, "game2.rez");
+        AddResourceTree(resTrees, nResTrees, "sound.rez");
+    }
+
+    bool bArchCfgSpecified = command_line_args->FindArgDash("archcfg") != NULL;
+    for (uint32 i = 0; i + 1 < command_line_args->Argc(); i++) {
+        const char *pszArg = command_line_args->Argv(i);
+        if (stricmp(pszArg, "-arch") == 0) {
+            AddResourceTree(resTrees, nResTrees, command_line_args->Argv(i + 1));
+        }
+        else if (stricmp(pszArg, "-archcfg") == 0) {
+            LoadArchiveConfig(command_line_args->Argv(i + 1), resTrees, nResTrees);
+        }
+    }
+
+    if (g_bFearMode && !bArchCfgSpecified) {
+        LoadArchiveConfig("Default.archcfg", resTrees, nResTrees);
+    }
+
+    if (g_bFearMode) {
+        dsi_ConsolePrint("Mounting %u resource trees in this order:", nResTrees);
+        for (uint32 i = 0; i < nResTrees; i++) {
+            dsi_ConsolePrint("  %u: %s", i, resTrees[i]);
+        }
+    }
 
     if (command_line_args->FindArgDash("noinput")) 
 	{
