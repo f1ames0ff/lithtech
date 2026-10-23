@@ -1424,3 +1424,18 @@ Soak `inp33` / `walk2` (`FEAR_AUTOSTART=1;FEAR_LOCAL_PLAYER=1;FEAR_AUTOWALK=420,
   on the predicted path (the player can walk through geometry).
 - Nothing yet plays the intro cutscene, and the third-person player body is
   created but not animated.
+
+### Follow-up checks after iteration 16
+
+- `Stub_GetClientObject_31` now enables the local player by default; only
+  `FEAR_LOCAL_PLAYER=0` disables it, so a plain interactive launch gets control
+  without extra environment variables.
+- Client-to-server delivery was instrumented. The retail server shell really
+  does receive the client stream through `pShell->OnMessage` (vtable slot 10):
+  `183` (start), `185` (start level), `132` (ready/ack) and the 419-byte
+  per-frame `id=2` packet all arrive. The authoritative player object still
+  stays at the spawn, so the missing link is server-side input handling, not
+  the message transport.
+- A plain autostart soak (`def1`) without `FEAR_LOCAL_PLAYER` walks the player
+  17600 units and stops cleanly, with `playerstate=1 inworld=1 gs=1` and no
+  crash.

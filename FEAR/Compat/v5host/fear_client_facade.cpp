@@ -721,7 +721,7 @@ static bool FearStub_LocalPlayerEnabled()
     {
         char szValue[8] = {0};
         DWORD nLen = GetEnvironmentVariableA("FEAR_LOCAL_PLAYER", szValue, sizeof(szValue));
-        s_nEnabled = (nLen > 0 && szValue[0] == '1') ? 1 : 0;
+        s_nEnabled = (nLen > 0 && szValue[0] == '0') ? 0 : 1;
     }
     return s_nEnabled != 0;
 }

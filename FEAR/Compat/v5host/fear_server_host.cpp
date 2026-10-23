@@ -425,6 +425,15 @@ void FearServerHost_Update(void)
             if (pMessage)
             {
                 pMessage->SeekTo(0);
+                static unsigned int s_nServerClientMsgs = 0;
+                ++s_nServerClientMsgs;
+                if (s_nServerClientMsgs <= 10)
+                {
+                    printf("FEARSERVER: client msg #%u size=%u id=%u\n",
+                        s_nServerClientMsgs, (unsigned)pMessage->Size(), (unsigned)pMessage->Readuint8());
+                    fflush(stdout);
+                    pMessage->SeekTo(0);
+                }
                 void **pVtable = *(void ***)pShell;
                 typedef void(__thiscall *TOnMessage)(void *, void *, ILTMessage_Read *);
                 TOnMessage pfnOnMessage = (TOnMessage)pVtable[10];
