@@ -1,6 +1,9 @@
+#include <windows.h>
+#include <intrin.h>
 #include "fear_client_facade.h"
 #include "iltmessage.h"
 #include "fear_host_api.h"
+#include "fear_render_api.h"
 #include "fear_renderer_stub.h"
 #include "fear_drawprim_stub.h"
 #include "fear_texturemgr_stub.h"
@@ -112,6 +115,9 @@ struct FearMappedObject
     bool m_bFromServer;
     float m_Pos[3];
     float m_Rotation[4];
+    float m_Dims[3];
+    unsigned int m_Flags[4];
+    unsigned int m_ObjectType;
 };
 
 static FearMappedObject g_FearMappedObjects[4096];
@@ -119,6 +125,9 @@ static int g_nFearMappedObjects = 0;
 static unsigned short g_nFearLocalServerObject = 0xFFFF;
 static HOBJECT g_hFearLocalClientObject = NULL;
 static int g_nFearServerMessageDepth = 0;
+static bool g_bFearLocalPlayerScope = false;
+static float g_fFearCameraFovX = 0.0f;
+static float g_fFearCameraFovY = 0.0f;
 
 static FearMappedObject *FearFindMappedObject(HOBJECT hObject)
 {
@@ -195,6 +204,12 @@ extern "C" HOBJECT FearClient_ResolveServerObject(unsigned short nServerId)
     if (!pEntry)
         return NULL;
 
+    // Placeholder player bounds until the real values arrive from the server.
+    pEntry->m_Dims[0] = 16.0f;
+    pEntry->m_Dims[1] = 16.0f;
+    pEntry->m_Dims[2] = 46.0f;
+    pEntry->m_Flags[OFT_Flags] = FLAG_VISIBLE;
+
     printf("FEARPORT: mapped server object %u -> %p\n", (unsigned)nServerId, hObject);
     fflush(stdout);
     return hObject;
@@ -210,6 +225,17 @@ extern "C" void FearClient_SetLocalServerObject(unsigned short nServerId)
     }
 
     g_hFearLocalClientObject = FearClient_ResolveServerObject(nServerId);
+
+    static unsigned short s_nLastLoggedId = 0xFFFE;
+    static HOBJECT s_hLastLoggedObject = (HOBJECT)0x1;
+    if (s_nLastLoggedId != nServerId || s_hLastLoggedObject != g_hFearLocalClientObject)
+    {
+        s_nLastLoggedId = nServerId;
+        s_hLastLoggedObject = g_hFearLocalClientObject;
+        printf("FEARPORT: local server object id=%u resolved=%p\n",
+            (unsigned)nServerId, (void *)g_hFearLocalClientObject);
+        fflush(stdout);
+    }
 }
 
 extern "C" void FearClient_BeginServerMessage(void)
@@ -249,6 +275,21 @@ extern "C" void FearClient_UpdateServerObjectTransform(unsigned short nServerId,
 
     if (pPos)
     {
+        static int s_nBadLogs = 0;
+        const bool bBad = !_finite(pPos[0]) || !_finite(pPos[1]) || !_finite(pPos[2]) ||
+            fabs(pPos[0]) > 1000000.0f || fabs(pPos[1]) > 1000000.0f || fabs(pPos[2]) > 1000000.0f;
+        if (bBad)
+        {
+            if (s_nBadLogs < 10)
+            {
+                ++s_nBadLogs;
+                printf("FEARPORT: reject server transform id=%u pos=%.1f %.1f %.1f\n",
+                    (unsigned)nServerId, pPos[0], pPos[1], pPos[2]);
+                fflush(stdout);
+            }
+            return;
+        }
+
         pEntry->m_Pos[0] = pPos[0];
         pEntry->m_Pos[1] = pPos[1];
         pEntry->m_Pos[2] = pPos[2];
@@ -263,8 +304,54 @@ extern "C" void FearClient_UpdateServerObjectTransform(unsigned short nServerId,
     }
 }
 
-extern "C" bool FearClient_GetObjectTransform(HOBJECT hObject, float *pPos, float *pRotation)
+extern "C" HOBJECT FearClient_GetGroundObject(void)
 {
+    static HOBJECT s_hGroundObject = NULL;
+    if (s_hGroundObject)
+        return s_hGroundObject;
+
+    const FearEngineApi *pApi = FearHost_GetEngineApi();
+    if (!pApi || !pApi->CreateObject)
+        return NULL;
+
+    FearObjectCreate foc;
+    memset(&foc, 0, sizeof(foc));
+    foc.m_ObjectType = 0;
+    foc.m_Scale = 1.0f;
+    foc.m_Rotation[3] = 1.0f;
+    strncpy(foc.m_Name, "FearGroundObject", sizeof(foc.m_Name) - 1);
+
+    s_hGroundObject = (HOBJECT)pApi->CreateObject(&foc);
+    if (s_hGroundObject)
+        FearClient_RegisterObject(s_hGroundObject);
+    return s_hGroundObject;
+}
+
+extern "C" bool FearClient_SetObjectPosition(HOBJECT hObject, const float *pPos)
+{
+    FearMappedObject *pEntry = FearFindMappedObject(hObject);
+    if (!pEntry || !pPos)
+        return false;
+
+    static int s_nBadPosLogs = 0;
+    if ((!_finite(pPos[0]) || !_finite(pPos[1]) || !_finite(pPos[2]) ||
+         fabs(pPos[0]) > 1000000.0f || fabs(pPos[1]) > 1000000.0f || fabs(pPos[2]) > 1000000.0f) &&
+        s_nBadPosLogs < 12)
+    {
+        ++s_nBadPosLogs;
+        printf("FEARPORT: bad SetObjectPosition obj=%p pos=%.1f %.1f %.1f ret=%p\n",
+            (void *)hObject, pPos[0], pPos[1], pPos[2], _ReturnAddress());
+        fflush(stdout);
+        return false;
+    }
+
+    pEntry->m_Pos[0] = pPos[0];
+    pEntry->m_Pos[1] = pPos[1];
+    pEntry->m_Pos[2] = pPos[2];
+    return true;
+}
+
+extern "C" bool FearClient_GetObjectTransform(HOBJECT hObject, float *pPos, float *pRotation){
     FearMappedObject *pEntry = FearFindMappedObject(hObject);
     if (!pEntry)
         return false;
@@ -285,6 +372,71 @@ extern "C" bool FearClient_GetObjectTransform(HOBJECT hObject, float *pPos, floa
     }
 
     return true;
+}
+
+extern "C" void FearClient_SetLocalPlayerScope(bool bInScope)
+{
+    g_bFearLocalPlayerScope = bInScope;
+}
+
+extern "C" bool FearClient_IsLocalPlayerScope(void)
+{
+    return g_bFearLocalPlayerScope;
+}
+
+extern "C" bool FearClient_SetObjectDims(HOBJECT hObject, const float *pDims)
+{
+    FearMappedObject *pEntry = FearFindMappedObject(hObject);
+    if (!pEntry || !pDims)
+        return false;
+
+    for (int i = 0; i < 3; ++i)
+        pEntry->m_Dims[i] = pDims[i];
+    return true;
+}
+
+extern "C" bool FearClient_GetObjectDims(HOBJECT hObject, float *pDims)
+{
+    FearMappedObject *pEntry = FearFindMappedObject(hObject);
+    if (!pEntry || !pDims)
+        return false;
+
+    for (int i = 0; i < 3; ++i)
+        pDims[i] = pEntry->m_Dims[i];
+    return true;
+}
+
+extern "C" bool FearClient_SetObjectFlags(HOBJECT hObject, unsigned int nFlagType, unsigned int nFlags, unsigned int nMask)
+{
+    FearMappedObject *pEntry = FearFindMappedObject(hObject);
+    if (!pEntry || nFlagType > 3)
+        return false;
+
+    pEntry->m_Flags[nFlagType] = (pEntry->m_Flags[nFlagType] & ~nMask) | (nFlags & nMask);
+    return true;
+}
+
+extern "C" bool FearClient_GetObjectFlags(HOBJECT hObject, unsigned int nFlagType, unsigned int *pFlags)
+{
+    FearMappedObject *pEntry = FearFindMappedObject(hObject);
+    if (!pEntry || !pFlags || nFlagType > 3)
+        return false;
+
+    *pFlags = pEntry->m_Flags[nFlagType];
+    return true;
+}
+
+extern "C" void FearClient_SetObjectType(HOBJECT hObject, unsigned int nObjectType)
+{
+    FearMappedObject *pEntry = FearFindMappedObject(hObject);
+    if (pEntry)
+        pEntry->m_ObjectType = nObjectType;
+}
+
+extern "C" unsigned int FearClient_GetObjectType(HOBJECT hObject)
+{
+    FearMappedObject *pEntry = FearFindMappedObject(hObject);
+    return pEntry ? pEntry->m_ObjectType : 0;
 }
 
 extern "C" void FearClient_RemoveObject(HOBJECT hObject)
@@ -465,6 +617,9 @@ static HLOCALOBJ Stub_CreateObject_17(ObjectCreateStruct *pStruct)
         hObject = pApi->CreateObject(&foc);
     }
     FearClient_RegisterObject(static_cast<HOBJECT>(hObject));
+    FearClient_SetObjectFlags(static_cast<HOBJECT>(hObject), OFT_Flags, pStruct->m_Flags, 0xFFFFFFFFu);
+    FearClient_SetObjectFlags(static_cast<HOBJECT>(hObject), OFT_Flags2, pStruct->m_Flags2, 0xFFFFFFFFu);
+    FearClient_SetObjectType(static_cast<HOBJECT>(hObject), pStruct->m_ObjectType);
     printf("FHOST CreateObject type=%u -> %p\n", (unsigned)pStruct->m_ObjectType, hObject);
     fflush(stdout);
     return static_cast<HLOCALOBJ>(hObject);
@@ -472,12 +627,28 @@ static HLOCALOBJ Stub_CreateObject_17(ObjectCreateStruct *pStruct)
 
 static void Stub_GetCameraFOV_18(HLOCALOBJ hObj, float *pX, float *pY)
 {
-    printf("STUB ILTClient::GetCameraFOV\n");
+    (void)hObj;
+    if (pX) *pX = g_fFearCameraFovX;
+    if (pY) *pY = g_fFearCameraFovY;
 }
 
 static void Stub_SetCameraFOV_19(HLOCALOBJ hObj, float fovX, float fovY)
 {
-    printf("STUB ILTClient::SetCameraFOV\n");
+    (void)hObj;
+    g_fFearCameraFovX = fovX;
+    g_fFearCameraFovY = fovY;
+
+    const FearEngineApi *pApi = FearHost_GetEngineApi();
+    if (pApi && pApi->m_pRenderApi && pApi->m_pRenderApi->SetCameraFov)
+        pApi->m_pRenderApi->SetCameraFov(fovX, fovY);
+
+    static bool s_bLogged = false;
+    if (!s_bLogged)
+    {
+        s_bLogged = true;
+        printf("FHOST camera fov x=%.4f rad y=%.4f rad\n", fovX, fovY);
+        fflush(stdout);
+    }
 }
 
 static void Stub_GetCameraRect_20(HLOCALOBJ hObj, LTRect2f& rCameraRect)
@@ -543,9 +714,24 @@ static void Stub_DebugOut_30(const char *pMsg, ...)
     printf("STUB ILTClient::DebugOut\n");
 }
 
+static bool FearStub_LocalPlayerEnabled()
+{
+    static int s_nEnabled = -1;
+    if (s_nEnabled < 0)
+    {
+        char szValue[8] = {0};
+        DWORD nLen = GetEnvironmentVariableA("FEAR_LOCAL_PLAYER", szValue, sizeof(szValue));
+        s_nEnabled = (nLen > 0 && szValue[0] == '1') ? 1 : 0;
+    }
+    return s_nEnabled != 0;
+}
+
 static HLOCALOBJ Stub_GetClientObject_31()
 {
-    return NULL;
+    if (!g_bFearLocalPlayerScope && !FearStub_LocalPlayerEnabled())
+        return NULL;
+
+    return FearClient_GetClientObject();
 }
 
 static LTRESULT Stub_FreeServiceList_32(NetService *pListHead)
@@ -671,12 +857,10 @@ LTRESULT CFearClient::GetObjectRotation(HLOCALOBJ hObj, LTRotation *pRotation)
         return LT_INVALIDPARAMS;
 
     float rotation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-    if (!FearClient_GetObjectTransform(hObj, NULL, rotation))
-        return LT_NOTFOUND;
-
+    const bool bFound = FearClient_GetObjectTransform(hObj, NULL, rotation);
     for (int i = 0; i < 4; ++i)
         pRotation->m_Quat[i] = rotation[i];
-    return LT_OK;
+    return bFound ? LT_OK : LT_NOTFOUND;
 }
 
 LTRESULT CFearClient::SetObjectRotation(HOBJECT hObj, const LTRotation& rRotation)
@@ -696,11 +880,10 @@ LTRESULT CFearClient::GetObjectPos(HLOCALOBJ hObj, LTVector *pPos)
         return LT_INVALIDPARAMS;
 
     float position[3] = {0.0f, 0.0f, 0.0f};
-    if (!FearClient_GetObjectTransform(hObj, position, NULL))
-        return LT_NOTFOUND;
-
+    const bool bFound = FearClient_GetObjectTransform(hObj, position, NULL);
     pPos->Init(position[0], position[1], position[2]);
-    return LT_OK;
+
+    return bFound ? LT_OK : LT_NOTFOUND;
 }
 
 LTRESULT CFearClient::SetObjectPos(HLOCALOBJ hObj, const LTVector& vPos)
@@ -708,6 +891,18 @@ LTRESULT CFearClient::SetObjectPos(HLOCALOBJ hObj, const LTVector& vPos)
     FearMappedObject *pEntry = FearFindMappedObject(hObj);
     if (!pEntry)
         return LT_NOTFOUND;
+
+    static int s_nBadSetLogs = 0;
+    if ((!_finite(vPos.x) || !_finite(vPos.y) || !_finite(vPos.z) ||
+         fabs(vPos.x) > 1000000.0f || fabs(vPos.y) > 1000000.0f || fabs(vPos.z) > 1000000.0f) &&
+        s_nBadSetLogs < 10)
+    {
+        ++s_nBadSetLogs;
+        printf("FEARPORT: bad SetObjectPos obj=%p pos=%.1f %.1f %.1f ret=%p\n",
+            (void *)hObj, vPos.x, vPos.y, vPos.z, _ReturnAddress());
+        fflush(stdout);
+        return LT_INVALIDPARAMS;
+    }
 
     pEntry->m_Pos[0] = vPos.x;
     pEntry->m_Pos[1] = vPos.y;
@@ -728,13 +923,12 @@ LTRESULT CFearClient::GetObjectTransform(HLOCALOBJ hObj, LTRigidTransform *pTran
 
     float position[3] = {0.0f, 0.0f, 0.0f};
     float rotation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-    if (!FearClient_GetObjectTransform(hObj, position, rotation))
-        return LT_NOTFOUND;
+    const bool bFound = FearClient_GetObjectTransform(hObj, position, rotation);
 
     pTransform->m_vPos.Init(position[0], position[1], position[2]);
     for (int i = 0; i < 4; ++i)
         pTransform->m_rRot.m_Quat[i] = rotation[i];
-    return LT_OK;
+    return bFound ? LT_OK : LT_NOTFOUND;
 }
 
 LTRESULT CFearClient::SetObjectTransform(HLOCALOBJ hObj, const LTRigidTransform& tTransform)
@@ -742,6 +936,18 @@ LTRESULT CFearClient::SetObjectTransform(HLOCALOBJ hObj, const LTRigidTransform&
     FearMappedObject *pEntry = FearFindMappedObject(hObj);
     if (!pEntry)
         return LT_NOTFOUND;
+
+    static int s_nBadTransformLogs = 0;
+    if ((!_finite(tTransform.m_vPos.x) || !_finite(tTransform.m_vPos.y) || !_finite(tTransform.m_vPos.z) ||
+         fabs(tTransform.m_vPos.x) > 1000000.0f || fabs(tTransform.m_vPos.y) > 1000000.0f ||
+         fabs(tTransform.m_vPos.z) > 1000000.0f) && s_nBadTransformLogs < 12)
+    {
+        ++s_nBadTransformLogs;
+        printf("FEARPORT: bad SetObjectTransform obj=%p pos=%.1f %.1f %.1f ret=%p\n",
+            (void *)hObj, tTransform.m_vPos.x, tTransform.m_vPos.y, tTransform.m_vPos.z, _ReturnAddress());
+        fflush(stdout);
+        return LT_INVALIDPARAMS;
+    }
 
     pEntry->m_Pos[0] = tTransform.m_vPos.x;
     pEntry->m_Pos[1] = tTransform.m_vPos.y;
@@ -758,13 +964,12 @@ LTRESULT CFearClient::GetObjectTransform(HLOCALOBJ hObj, LTTransform *pTransform
 
     float position[3] = {0.0f, 0.0f, 0.0f};
     float rotation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-    if (!FearClient_GetObjectTransform(hObj, position, rotation))
-        return LT_NOTFOUND;
+    const bool bFound = FearClient_GetObjectTransform(hObj, position, rotation);
 
     pTransform->m_vPos.Init(position[0], position[1], position[2]);
     for (int i = 0; i < 4; ++i)
         pTransform->m_rRot.m_Quat[i] = rotation[i];
-    return LT_OK;
+    return bFound ? LT_OK : LT_NOTFOUND;
 }
 
 ILTResourceMgr* CFearClient::ResourceMgr()
@@ -1404,18 +1609,31 @@ LTRESULT CFearClient::SendToServer(ILTMessage_Read *pMsg, uint32 flags)
     if (!pMsg || !FearServerHost_IsRunning())
         return LT_ERROR;
 
+    static unsigned int s_nClientMsgCounts[256];
+
     uint32 nSaved = pMsg->Tell();
     unsigned char nMessageID = (unsigned char)pMsg->ReadBits(8);
     pMsg->SeekTo(nSaved);
-    printf("FEARPORT: client message id=%u", (unsigned)nMessageID);
-    pMsg->SeekTo(nSaved);
-    pMsg->ReadBits(8);
-    if (nMessageID == 160)
-        printf(" pause=%u", (unsigned)pMsg->ReadBits(1));
-    else if (nMessageID == 245)
-        printf(" state=%u", (unsigned)pMsg->ReadBits(8));
-    printf("\n");
-    fflush(stdout);
+    unsigned int nCount = ++s_nClientMsgCounts[nMessageID];
+    if (nCount == 1 || (nCount % 600) == 0)
+    {
+        printf("FEARPORT: client message id=%u count=%u", (unsigned)nMessageID, nCount);
+        pMsg->SeekTo(nSaved);
+        pMsg->ReadBits(8);
+        if (nMessageID == 160)
+            printf(" pause=%u", (unsigned)pMsg->ReadBits(1));
+        else if (nMessageID == 245)
+            printf(" state=%u", (unsigned)pMsg->ReadBits(8));
+        else if (nMessageID == 192)
+        {
+            printf(" size=%u bytes=", (unsigned)pMsg->Size());
+            pMsg->SeekTo(0);
+            for (int i = 0; i < 20 && pMsg->Tell() < (int)pMsg->Size(); ++i)
+                printf("%02x", (unsigned)pMsg->ReadBits(8));
+        }
+        printf("\n");
+        fflush(stdout);
+    }
     pMsg->SeekTo(nSaved);
 
     ILTMessage_Read *pCopy = pMsg->Clone();

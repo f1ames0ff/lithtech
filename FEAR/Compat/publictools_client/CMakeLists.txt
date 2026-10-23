@@ -44,6 +44,30 @@ file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/ScreenMain.cpp" "${SCREENMAIN_SOURCE_TEX
 list(REMOVE_ITEM CLIENT_SHELL_SOURCES "${SCREENMAIN_ORIGINAL}")
 list(APPEND CLIENT_SHELL_SOURCES "${CMAKE_CURRENT_BINARY_DIR}/ScreenMain.cpp")
 
+# Port-side hardening. The retail client always has a fully resolved player body
+# model, so these paths assume non-NULL animation contexts and profile data.
+set(PLAYERBODYMGR_ORIGINAL "${FEAR_PUBLIC_TOOLS_SOURCE}/Game/ClientShellDLL/PlayerBodyMgr.cpp")
+file(READ "${PLAYERBODYMGR_ORIGINAL}" PLAYERBODYMGR_SOURCE_TEXT)
+string(REPLACE [=[	if( !m_hPlayerBody )
+		return false;
+
+	const CAnimationContext *apContexts[kNumContexts]]=] [=[	if( !m_hPlayerBody || !m_hModel || !m_pLowerAnimationContext )
+		return false;
+
+	const CAnimationContext *apContexts[kNumContexts]]=] PLAYERBODYMGR_SOURCE_TEXT "${PLAYERBODYMGR_SOURCE_TEXT}")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/PlayerBodyMgr.cpp" "${PLAYERBODYMGR_SOURCE_TEXT}")
+list(REMOVE_ITEM CLIENT_SHELL_SOURCES "${PLAYERBODYMGR_ORIGINAL}")
+list(APPEND CLIENT_SHELL_SOURCES "${CMAKE_CURRENT_BINARY_DIR}/PlayerBodyMgr.cpp")
+
+set(CHARACTERFX_ORIGINAL "${FEAR_PUBLIC_TOOLS_SOURCE}/Game/ClientShellDLL/CharacterFX.cpp")
+file(READ "${CHARACTERFX_ORIGINAL}" CHARACTERFX_SOURCE_TEXT)
+string(REPLACE [=[if (m_bSeverBody && !g_pProfileMgr->GetCurrentProfile()->m_bGore)]=] [=[if (m_bSeverBody && g_pProfileMgr->GetCurrentProfile() && !g_pProfileMgr->GetCurrentProfile()->m_bGore)]=] CHARACTERFX_SOURCE_TEXT "${CHARACTERFX_SOURCE_TEXT}")
+string(REPLACE [=[if (!g_pProfileMgr->GetCurrentProfile()->m_bAllowBroadcast)]=] [=[if (g_pProfileMgr->GetCurrentProfile() && !g_pProfileMgr->GetCurrentProfile()->m_bAllowBroadcast)]=] CHARACTERFX_SOURCE_TEXT "${CHARACTERFX_SOURCE_TEXT}")
+string(REPLACE [=[if (!g_pProfileMgr->GetCurrentProfile()->m_bGore)]=] [=[if (g_pProfileMgr->GetCurrentProfile() && !g_pProfileMgr->GetCurrentProfile()->m_bGore)]=] CHARACTERFX_SOURCE_TEXT "${CHARACTERFX_SOURCE_TEXT}")
+file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/CharacterFX.cpp" "${CHARACTERFX_SOURCE_TEXT}")
+list(REMOVE_ITEM CLIENT_SHELL_SOURCES "${CHARACTERFX_ORIGINAL}")
+list(APPEND CLIENT_SHELL_SOURCES "${CMAKE_CURRENT_BINARY_DIR}/CharacterFX.cpp")
+
 set(FEAR_COMMON_INCLUDES
     "${FEAR_SDK_INC}"
     "${FEAR_PUBLIC_TOOLS_SOURCE}/Game/ClientShellDLL"

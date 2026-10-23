@@ -7,5 +7,5 @@ Rez
 *.REZ
 .vscode
 .idea/
-opencode.jsonc
+.mcp.json
 codeblocks

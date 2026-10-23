@@ -1,11 +1,56 @@
 #include "fear_model_stub.h"
 #include <stdio.h>
+#include <map>
+#include <string>
+#include <vector>
 
 template <typename T> struct SvcDefault { static T Get() { return T(); } };
 template <> struct SvcDefault<LTRESULT> { static LTRESULT Get() { return LT_UNSUPPORTED; } };
 template <> struct SvcDefault<const char*> { static const char* Get() { return ""; } };
 
 CFearModel g_FearModel;
+
+namespace
+{
+
+struct FearModelWeights
+{
+    bool m_bInit;
+    bool m_Trackers[256];
+    HMODELWEIGHTSET m_TrackerWeight[256];
+};
+
+std::map<HOBJECT, FearModelWeights> g_ModelWeights;
+std::vector<std::string> g_WeightSetNames;
+
+FearModelWeights &FearModelWeightsFor(HOBJECT hObj)
+{
+    FearModelWeights &state = g_ModelWeights[hObj];
+    if (!state.m_bInit)
+    {
+        state.m_bInit = true;
+        for (int i = 0; i < 256; ++i)
+        {
+            state.m_Trackers[i] = false;
+            state.m_TrackerWeight[i] = INVALID_MODEL_WEIGHTSET;
+        }
+    }
+    return state;
+}
+
+HMODELWEIGHTSET FearModelWeightSetHandle(const char *pszName)
+{
+    std::string name = pszName ? pszName : "";
+    for (size_t i = 0; i < g_WeightSetNames.size(); ++i)
+    {
+        if (g_WeightSetNames[i] == name)
+            return (HMODELWEIGHTSET)(i + 1);
+    }
+    g_WeightSetNames.push_back(name);
+    return (HMODELWEIGHTSET)g_WeightSetNames.size();
+}
+
+}
 
 LTRESULT CFearModel::GetSocket(HOBJECT hObj, const char *pSocketName, HMODELSOCKET &hSocket)
 {
@@ -189,14 +234,25 @@ LTRESULT CFearModel::GetPlaybackState(HOBJECT hModel, ANIMTRACKERID TrackerID, u
 
 LTRESULT CFearModel::AddTracker(HOBJECT hModel, ANIMTRACKERID TrackerID, bool bNetwork)
 {
-    printf("STUB ILTModel::AddTracker\n");
-    return SvcDefault<LTRESULT>::Get();
+    if (!hModel)
+        return LT_INVALIDPARAMS;
+
+    FearModelWeights &state = FearModelWeightsFor(hModel);
+    state.m_Trackers[TrackerID] = true;
+    printf("FEARMODEL: AddTracker %u network=%d\n", (unsigned)TrackerID, bNetwork ? 1 : 0);
+    return LT_OK;
 }
 
 LTRESULT CFearModel::RemoveTracker(HOBJECT hModel, ANIMTRACKERID TrackerID)
 {
-    printf("STUB ILTModel::RemoveTracker\n");
-    return SvcDefault<LTRESULT>::Get();
+    if (!hModel)
+        return LT_INVALIDPARAMS;
+
+    FearModelWeights &state = FearModelWeightsFor(hModel);
+    state.m_Trackers[TrackerID] = false;
+    state.m_TrackerWeight[TrackerID] = INVALID_MODEL_WEIGHTSET;
+    printf("FEARMODEL: RemoveTracker %u\n", (unsigned)TrackerID);
+    return LT_OK;
 }
 
 LTRESULT CFearModel::SetAnimBlend(HOBJECT hModel, ANIMTRACKERID TrackerID, float fBlend)
@@ -303,20 +359,36 @@ LTRESULT CFearModel::GetAnimRate(HOBJECT hModel, ANIMTRACKERID TrackerID, float 
 
 LTRESULT CFearModel::FindWeightSet(HOBJECT hObj, const char *pSetName, HMODELWEIGHTSET &hSet)
 {
-    printf("STUB ILTModel::FindWeightSet\n");
-    return SvcDefault<LTRESULT>::Get();
+    if (!hObj || !pSetName)
+        return LT_INVALIDPARAMS;
+
+    FearModelWeightsFor(hObj);
+    hSet = FearModelWeightSetHandle(pSetName);
+    printf("FEARMODEL: FindWeightSet '%s' -> %u\n", pSetName, (unsigned)hSet);
+    return LT_OK;
 }
 
 LTRESULT CFearModel::GetWeightSet(HOBJECT hModel, ANIMTRACKERID TrackerID, HMODELWEIGHTSET &hSet)
 {
-    printf("STUB ILTModel::GetWeightSet\n");
-    return SvcDefault<LTRESULT>::Get();
+    if (!hModel)
+        return LT_INVALIDPARAMS;
+
+    FearModelWeights &state = FearModelWeightsFor(hModel);
+    hSet = state.m_TrackerWeight[TrackerID];
+    if (hSet == INVALID_MODEL_WEIGHTSET)
+        hSet = FearModelWeightSetHandle("null");
+    return LT_OK;
 }
 
 LTRESULT CFearModel::SetWeightSet(HOBJECT hModel, ANIMTRACKERID TrackerID, HMODELWEIGHTSET hSet)
 {
-    printf("STUB ILTModel::SetWeightSet\n");
-    return SvcDefault<LTRESULT>::Get();
+    if (!hModel)
+        return LT_INVALIDPARAMS;
+
+    FearModelWeights &state = FearModelWeightsFor(hModel);
+    state.m_TrackerWeight[TrackerID] = hSet;
+    state.m_Trackers[TrackerID] = true;
+    return LT_OK;
 }
 
 LTRESULT CFearModel::FindPhysicsWeightSet(HOBJECT hModel, const char* pszName, HPHYSICSWEIGHTSET& hSet)

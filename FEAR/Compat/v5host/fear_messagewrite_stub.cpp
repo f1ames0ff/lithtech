@@ -164,7 +164,10 @@ void CFearMessageWrite::WriteYRotation(const LTRotation &cRotation)
 
 void CFearMessageWrite::WriteDatabaseRecord(IDatabaseMgr *pDatabase, HRECORD hRecord)
 {
-    WriteBits64(reinterpret_cast<uint64>(hRecord), 64);
+    uint32 nIndex = 0xFFFF;
+    if (pDatabase && hRecord)
+        nIndex = pDatabase->GetRecordIndex(hRecord);
+    WriteBits(nIndex, 16);
 }
 
 void CFearMessageWrite::WriteTimer(HENGINETIMER hTimer)

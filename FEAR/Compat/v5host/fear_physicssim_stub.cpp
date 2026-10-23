@@ -364,6 +364,6 @@ LTRESULT CFearPhysicsSim::GetModelRigidBody(HOBJECT hModel, uint32 nRigidBody, H
 
 LTRESULT CFearPhysicsSim::GetModelNodeRigidBody(HOBJECT hModel, HMODELNODE hNode, HPHYSICSRIGIDBODY& hRigidBody) { return LT_UNSUPPORTED; }
 
-LTRESULT CFearPhysicsSim::SetObjectPhysicsGroup(HOBJECT hObject, EPhysicsGroup eGroup) { return LT_UNSUPPORTED; }
+LTRESULT CFearPhysicsSim::SetObjectPhysicsGroup(HOBJECT hObject, EPhysicsGroup eGroup) { return LT_OK; }
 
 CPhysicsSimulation* CFearPhysicsSim::GetSimulation() { return NULL; }

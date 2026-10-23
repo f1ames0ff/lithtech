@@ -13,6 +13,7 @@
 #include "fear_client_facade.h"
 #include "fear_object_map.h"
 #include "fear_server_host.h"
+#include "fear_input_stub.h"
 #include "fear_resourcemgr_stub.h"
 #include "fear_common_stub.h"
 #include "fear_physics_stub.h"
@@ -73,7 +74,10 @@ typedef void (*TFearClientRenderWorldPreview)();
 typedef int (*TFearClientStartNewGame)();
 typedef int (*TFearClientIsPlaying)();
 typedef int (*TFearClientPreparePortPlayer)(void *);
+typedef int (*TFearClientCreateLocalCharacter)(void *);
 typedef void (*TFearClientRenderPortCamera)();
+typedef int (*TFearClientInstallDefaultBindings)();
+typedef void (*TFearClientLogInputState)();
 
 static TFearClientMouseMove g_pfnClientMouseMove = NULL;
 static TFearClientMouseButton g_pfnClientMouseButton = NULL;
@@ -90,7 +94,10 @@ static TFearClientRenderWorldPreview g_pfnClientRenderWorldPreview = NULL;
 static TFearClientStartNewGame g_pfnClientStartNewGame = NULL;
 static TFearClientIsPlaying g_pfnClientIsPlaying = NULL;
 static TFearClientPreparePortPlayer g_pfnClientPreparePortPlayer = NULL;
+static TFearClientCreateLocalCharacter g_pfnClientCreateLocalCharacter = NULL;
 static TFearClientRenderPortCamera g_pfnClientRenderPortCamera = NULL;
+static TFearClientInstallDefaultBindings g_pfnClientInstallDefaultBindings = NULL;
+static TFearClientLogInputState g_pfnClientLogInputState = NULL;
 
 static bool g_bWorldPreview = false;
 static bool g_bAwaitPostload = false;
@@ -103,10 +110,22 @@ static int g_nPreviewLastMouseY = 240;
 static bool g_bPreviewMouseInitialized = false;
 static DWORD g_nPreviewLastTick = 0;
 
+extern "C" __declspec(dllexport) void FearHost_OnKeyDown(int key, int rep);
+extern "C" __declspec(dllexport) void FearHost_OnKeyUp(int key);
+
 static void FearHost_UpdatePreviewCamera()
 {
     if (g_pEngineApi && g_pEngineApi->m_pRenderApi && g_pEngineApi->m_pRenderApi->SetWorldCamera)
         g_pEngineApi->m_pRenderApi->SetWorldCamera(g_fPreviewPos, g_fPreviewYaw, g_fPreviewPitch);
+}
+
+static unsigned int g_nServerMsgCounts[256];
+static unsigned int g_nClientMsgCounts[256];
+
+static bool FearHost_ShouldLogMsg(unsigned int *pCounts, unsigned int nId)
+{
+    unsigned int nCount = ++pCounts[nId];
+    return nCount == 1 || (nCount % 600) == 0;
 }
 
 extern "C" void FearHost_DeliverServerMessage(ILTMessage_Read *pMessage)
@@ -118,35 +137,48 @@ extern "C" void FearHost_DeliverServerMessage(ILTMessage_Read *pMessage)
     unsigned char nMessageID = (unsigned char)pMessage->ReadBits(8);
     pMessage->SeekTo(nSaved);
 
+    bool bLogMsg = FearHost_ShouldLogMsg(g_nServerMsgCounts, nMessageID);
     unsigned char nMessageState = 0;
-    printf("FEARPORT: server message id=%u", (unsigned)nMessageID);
+    if (bLogMsg)
+        printf("FEARPORT: server message id=%u count=%u", (unsigned)nMessageID, g_nServerMsgCounts[nMessageID]);
     if (nMessageID == 187)
     {
-        printf(" save-data refused\n");
+        if (bLogMsg)
+            printf(" save-data refused\n");
         fflush(stdout);
         if (g_pfnClientReplySaveFailed)
             g_pfnClientReplySaveFailed();
         return;
     }
     if (nMessageID == 103 || nMessageID == 126 || nMessageID == 129 || nMessageID == 145 ||
-        nMessageID == 212 || nMessageID == 229 || nMessageID == 233 || nMessageID == 138 ||
+        nMessageID == 229 || nMessageID == 233 || nMessageID == 138 ||
         nMessageID == 230 || nMessageID == 231)
     {
-        printf(" skipped\n");
-        fflush(stdout);
+        if (bLogMsg)
+        {
+            printf(" skipped\n");
+            fflush(stdout);
+        }
         return;
     }
     pMessage->SeekTo(nSaved);
     pMessage->ReadBits(8);
-    if (nMessageID == 160)
-        printf(" pause=%u", (unsigned)pMessage->ReadBits(1));
+    if (bLogMsg)
+    {
+        if (nMessageID == 160)
+            printf(" pause=%u", (unsigned)pMessage->ReadBits(1));
+        else if (nMessageID == 245 || nMessageID == 195 || nMessageID == 105)
+        {
+            nMessageState = (unsigned char)pMessage->ReadBits(8);
+            printf(" state=%u", (unsigned)nMessageState);
+        }
+        printf("\n");
+        fflush(stdout);
+    }
     else if (nMessageID == 245 || nMessageID == 195 || nMessageID == 105)
     {
         nMessageState = (unsigned char)pMessage->ReadBits(8);
-        printf(" state=%u", (unsigned)nMessageState);
     }
-    printf("\n");
-    fflush(stdout);
     pMessage->SeekTo(nSaved);
     if (nMessageID == 245 && nMessageState == 12)
         g_bAwaitPostload = true;
@@ -184,10 +216,23 @@ const FearEngineApi *FearHost_GetEngineApi(void)
     return g_pEngineApi;
 }
 
+static void FearHost_OpenLogFile(void)
+{
+    char szPath[1024];
+    DWORD nLen = GetEnvironmentVariableA("FEAR_HOST_LOG", szPath, (DWORD)sizeof(szPath));
+    if (nLen == 0 || nLen >= (DWORD)sizeof(szPath))
+        return;
+    if (!freopen(szPath, "w", stdout))
+        return;
+    freopen(szPath, "a", stderr);
+    setvbuf(stdout, NULL, _IONBF, 0);
+}
+
 extern "C" __declspec(dllexport) int FearHost_Init(const char *pszGameClientDll, const FearEngineApi *pApi)
 {
     setvbuf(stdout, NULL, _IONBF, 0);
     setvbuf(stderr, NULL, _IONBF, 0);
+    FearHost_OpenLogFile();
     g_pEngineApi = pApi;
     CInterfaceDatabase *pMaster = GetMasterDatabase();
     g_hGameClient = LoadLibraryA(pszGameClientDll);
@@ -204,6 +249,8 @@ extern "C" __declspec(dllexport) int FearHost_Init(const char *pszGameClientDll,
     g_pfnClientPreLoadWorld = (TFearClientPreLoadWorld)GetProcAddress(g_hGameClient, "FearClient_PreLoadWorld");
     g_pfnClientOnEnterWorld = (TFearClientOnEnterWorld)GetProcAddress(g_hGameClient, "FearClient_OnEnterWorld");
     g_pfnClientLogState = (TFearClientLogState)GetProcAddress(g_hGameClient, "FearClient_LogState");
+    g_pfnClientInstallDefaultBindings = (TFearClientInstallDefaultBindings)GetProcAddress(g_hGameClient, "FearClient_InstallDefaultBindings");
+    g_pfnClientLogInputState = (TFearClientLogInputState)GetProcAddress(g_hGameClient, "FearClient_LogInputState");
     g_pfnClientIsPostload = (TFearClientIsPostload)GetProcAddress(g_hGameClient, "FearClient_IsPostload");
     g_pfnClientPressKey = (TFearClientPressKey)GetProcAddress(g_hGameClient, "FearClient_PressKey");
     g_pfnClientReplySaveFailed = (TFearClientReplySaveFailed)GetProcAddress(g_hGameClient, "FearClient_ReplySaveFailed");
@@ -212,6 +259,7 @@ extern "C" __declspec(dllexport) int FearHost_Init(const char *pszGameClientDll,
     g_pfnClientStartNewGame = (TFearClientStartNewGame)GetProcAddress(g_hGameClient, "FearClient_StartNewGame");
     g_pfnClientIsPlaying = (TFearClientIsPlaying)GetProcAddress(g_hGameClient, "FearClient_IsPlaying");
     g_pfnClientPreparePortPlayer = (TFearClientPreparePortPlayer)GetProcAddress(g_hGameClient, "FearClient_PreparePortPlayer");
+    g_pfnClientCreateLocalCharacter = (TFearClientCreateLocalCharacter)GetProcAddress(g_hGameClient, "FearClient_CreateLocalCharacter");
     g_pfnClientRenderPortCamera = (TFearClientRenderPortCamera)GetProcAddress(g_hGameClient, "FearClient_RenderPortCamera");
     FearServerHost_SetMessageSink(FearHost_DeliverServerMessage);
     char szRetailAbi[16] = {0};
@@ -258,7 +306,12 @@ extern "C" __declspec(dllexport) void FearHost_Update(void)
         float rotation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
         FearClient_SetLocalServerObject(nPlayerObjectId);
         if (FearServerHost_GetPlayerTransform(position, rotation))
-            FearClient_UpdateServerObjectTransform(nPlayerObjectId, position, rotation);
+        {
+            // While the client owns the local player, its predicted position is
+            // authoritative for rendering; the server transform must not snap it back.
+            if (!FearClient_IsLocalPlayerScope())
+                FearClient_UpdateServerObjectTransform(nPlayerObjectId, position, rotation);
+        }
     }
 
     if (!g_pShell)
@@ -279,12 +332,26 @@ extern "C" __declspec(dllexport) void FearHost_Update(void)
         if (nObjectId == 0xFFFF)
             nObjectId = 0;
 
-        HOBJECT hTarget = FearClient_ResolveServerObject(nObjectId);
-        if (hTarget && g_pfnClientPreparePortPlayer(hTarget))
+        HOBJECT hTarget = FearClient_GetClientObject();
+        if (!hTarget)
+            hTarget = FearClient_ResolveServerObject(nObjectId);
+
+        if (hTarget)
         {
-            s_bPortCameraReady = true;
-            printf("FEARPORT: port camera ready target=%p id=%u\n", hTarget, (unsigned)nObjectId);
-            fflush(stdout);
+            int nLocalPlayer = 0;
+            if (g_pfnClientCreateLocalCharacter)
+            {
+                FearClient_SetLocalPlayerScope(true);
+                nLocalPlayer = g_pfnClientCreateLocalCharacter(hTarget);
+                FearClient_SetLocalPlayerScope(false);
+            }
+
+            if (g_pfnClientPreparePortPlayer(hTarget))
+            {
+                s_bPortCameraReady = true;
+                printf("FEARPORT: port camera ready target=%p id=%u localplayer=%d\n", hTarget, (unsigned)nObjectId, nLocalPlayer);
+                fflush(stdout);
+            }
         }
     }
 
@@ -300,6 +367,7 @@ extern "C" __declspec(dllexport) void FearHost_Update(void)
     static int s_nMenuFrames = 0;
     static int s_nAutoStartAttempts = 0;
     static int s_bAutoStart = -1;
+    static int s_bBindingsInstalled = -1;
     if (s_bAutoStart < 0)
     {
         char szAutoStart[8] = {0};
@@ -307,8 +375,28 @@ extern "C" __declspec(dllexport) void FearHost_Update(void)
         s_bAutoStart = (nLen > 0 && szAutoStart[0] != '0') ? 1 : 0;
     }
     ++s_nMenuFrames;
-    if (g_pfnClientLogState && (s_nMenuFrames % 300) == 0)
+    if (s_bBindingsInstalled != 1 && g_pfnClientInstallDefaultBindings && (s_nMenuFrames % 30) == 0)
+    {
+        s_bBindingsInstalled = g_pfnClientInstallDefaultBindings();
+        if (s_bBindingsInstalled == 1)
+        {
+            printf("FEARPORT: default command bindings installed\n");
+            fflush(stdout);
+        }
+    }
+    if (g_pfnClientLogState && (s_nMenuFrames % 60) == 0)
+    {
+        float vSrvPos[3] = {0.0f, 0.0f, 0.0f};
+        float vSrvRot[4] = {0.0f, 0.0f, 0.0f, 1.0f};
+        int nHasSrv = FearServerHost_GetPlayerTransform(vSrvPos, vSrvRot) ? 1 : 0;
+        printf("FEARPORT: serverframe=%d srvplayer=%d pos=%.2f %.2f %.2f inputqueries=%d\n",
+            s_nMenuFrames, nHasSrv, vSrvPos[0], vSrvPos[1], vSrvPos[2],
+            FearInput_GetQueryCounter() ? *FearInput_GetQueryCounter() : -1);
+        fflush(stdout);
         g_pfnClientLogState();
+        if (g_pfnClientLogInputState)
+            g_pfnClientLogInputState();
+    }
     if (s_bAutoStart && !g_bFearConnected && g_pfnClientStartNewGame &&
         s_nMenuFrames > 120 && s_nAutoStartAttempts < 1 && (s_nMenuFrames % 60) == 0)
     {
@@ -317,10 +405,49 @@ extern "C" __declspec(dllexport) void FearHost_Update(void)
         printf("FEARPORT: auto-start new game attempt=%d result=%d\n", s_nAutoStartAttempts, nStarted);
         fflush(stdout);
     }
+
+    static int s_nAutoWalkDown = -1;
+    static int s_nAutoWalkUp = -1;
+    static int s_bAutoWalkPressed = 0;
+    static int s_nAutoWalkKey = 0x57;
+    if (s_nAutoWalkDown < 0)
+    {
+        char szWalk[64] = {0};
+        if (GetEnvironmentVariableA("FEAR_AUTOWALK", szWalk, sizeof(szWalk)) > 0)
+        {
+            int nDown = 0, nUp = 0, nKey = 0x57;
+            int nFields = sscanf(szWalk, "%d,%d,%d", &nDown, &nUp, &nKey);
+            if (nFields >= 2)
+            {
+                s_nAutoWalkDown = nDown;
+                s_nAutoWalkUp = nUp;
+                s_nAutoWalkKey = nKey;
+                printf("FEARPORT: autowalk key=%d down=%d up=%d\n", nKey, nDown, nUp);
+            }
+        }
+        if (s_nAutoWalkDown < 0)
+            s_nAutoWalkDown = 0x7FFFFFFF;
+    }
+
+    if (!s_bAutoWalkPressed && s_nMenuFrames >= s_nAutoWalkDown && !g_bWorldPreview)
+    {
+        s_bAutoWalkPressed = 1;
+        FearHost_OnKeyDown(s_nAutoWalkKey, 0);
+        printf("FEARPORT: autowalk key down at frame %d\n", s_nMenuFrames);
+        fflush(stdout);
+    }
+    else if (s_bAutoWalkPressed == 1 && s_nMenuFrames >= s_nAutoWalkUp && !g_bWorldPreview)
+    {
+        s_bAutoWalkPressed = 2;
+        FearHost_OnKeyUp(s_nAutoWalkKey);
+        printf("FEARPORT: autowalk key up at frame %d\n", s_nMenuFrames);
+        fflush(stdout);
+    }
 }
 
 extern "C" __declspec(dllexport) void FearHost_OnKeyDown(int key, int rep)
 {
+    FearInput_SetKeyState(key, true);
     if (g_bWorldPreview)
     {
         if (key >= 0 && key < 256)
@@ -333,6 +460,7 @@ extern "C" __declspec(dllexport) void FearHost_OnKeyDown(int key, int rep)
 
 extern "C" __declspec(dllexport) void FearHost_OnKeyUp(int key)
 {
+    FearInput_SetKeyState(key, false);
     if (g_bWorldPreview)
     {
         if (key >= 0 && key < 256)
@@ -345,6 +473,7 @@ extern "C" __declspec(dllexport) void FearHost_OnKeyUp(int key)
 
 extern "C" __declspec(dllexport) void FearHost_OnMouseMove(int x, int y)
 {
+    FearInput_SetMousePos(x, y);
     if (g_bWorldPreview)
     {
         if (!g_bPreviewMouseInitialized)
@@ -373,6 +502,8 @@ extern "C" __declspec(dllexport) void FearHost_OnMouseMove(int x, int y)
 
 extern "C" __declspec(dllexport) void FearHost_OnMouseButton(int nButton, int nDown, int x, int y)
 {
+    FearInput_SetMouseButton(nButton, nDown != 0);
+    FearInput_SetMousePos(x, y);
     if (g_bWorldPreview)
         return;
     if (g_pfnClientMouseButton)

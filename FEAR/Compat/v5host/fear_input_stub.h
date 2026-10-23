@@ -5,6 +5,26 @@
 #include "ltbasedefs.h"
 #include "iltinput.h"
 
+// Fixed device/object layout of CFearInput. Kept stable so the client shell can
+// install default bindings without querying the interface.
+enum
+{
+    FEAR_INPUT_DEVICE_KEYBOARD = 0,
+    FEAR_INPUT_DEVICE_MOUSE    = 1,
+
+    FEAR_INPUT_MOUSE_AXIS_X    = 0,
+    FEAR_INPUT_MOUSE_AXIS_Y    = 1,
+    FEAR_INPUT_MOUSE_BUTTON_0  = 2,
+    FEAR_INPUT_MOUSE_BUTTON_1  = 3,
+    FEAR_INPUT_MOUSE_BUTTON_2  = 4
+};
+
+// State feed used by the host window message pump.
+void FearInput_SetKeyState(int nVKCode, bool bDown);
+void FearInput_SetMousePos(int x, int y);
+void FearInput_SetMouseButton(int nButton, bool bDown);
+void FearInput_ClearState(void);
+int *FearInput_GetQueryCounter(void);
 class CFearInput : public ILTInput
 {
 public:

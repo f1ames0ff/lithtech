@@ -6,6 +6,7 @@
 int FearWorld_Load(const char *pszFilename);
 void FearWorld_Render(IDirect3DDevice9 *pDevice);
 void FearWorld_SetCamera(const float *pPos, float fYaw, float fPitch);
+void FearWorld_SetFov(float fFovX, float fFovY);
 void FearWorld_Shutdown();
 
 #endif

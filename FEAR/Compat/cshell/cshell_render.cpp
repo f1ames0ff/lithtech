@@ -766,35 +766,66 @@ static int FearRender_MakeScreenShot(const char *pszFilename)
     }
 
     IDirect3DDevice9 *pDevice = (IDirect3DDevice9 *)pDeviceValue;
-    IDirect3DSurface9 *pBackBuffer = NULL;
+    IDirect3DSurface9 *pPreviousTarget = NULL;
+    IDirect3DSurface9 *pPreviousDepth = NULL;
+    IDirect3DTexture9 *pCaptureTexture = NULL;
+    IDirect3DSurface9 *pCaptureTarget = NULL;
+    IDirect3DSurface9 *pCaptureDepth = NULL;
     IDirect3DSurface9 *pOffscreen = NULL;
-    if (FAILED(pDevice->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &pBackBuffer)) || !pBackBuffer)
-    {
-        printf("FEARRENDER: screenshot failed backbuffer\n");
-        fflush(stdout);
-        return 0;
-    }
 
     D3DSURFACE_DESC desc;
     memset(&desc, 0, sizeof(desc));
-    if (FAILED(pBackBuffer->GetDesc(&desc)) ||
+    if (FAILED(pDevice->GetRenderTarget(0, &pPreviousTarget)) || !pPreviousTarget ||
+        FAILED(pPreviousTarget->GetDesc(&desc)))
+    {
+        printf("FEARRENDER: screenshot failed backbuffer\n");
+        fflush(stdout);
+        if (pPreviousTarget)
+            pPreviousTarget->Release();
+        return 0;
+    }
+
+    const HRESULT hrTarget = pDevice->CreateTexture(desc.Width, desc.Height, 1, D3DUSAGE_RENDERTARGET,
+        D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &pCaptureTexture, NULL);
+    if (FAILED(hrTarget) || !pCaptureTexture ||
+        FAILED(pCaptureTexture->GetSurfaceLevel(0, &pCaptureTarget)) || !pCaptureTarget ||
+        FAILED(pDevice->GetDepthStencilSurface(&pPreviousDepth)) ||
+        FAILED(pDevice->CreateDepthStencilSurface(desc.Width, desc.Height, D3DFMT_D24S8,
+            D3DMULTISAMPLE_NONE, 0, FALSE, &pCaptureDepth, NULL)) ||
         FAILED(pDevice->CreateOffscreenPlainSurface(desc.Width, desc.Height, D3DFMT_A8R8G8B8,
             D3DPOOL_SYSTEMMEM, &pOffscreen, NULL)) ||
         !pOffscreen)
     {
         printf("FEARRENDER: screenshot failed surface\n");
         fflush(stdout);
-        pBackBuffer->Release();
+        if (pCaptureDepth)
+            pCaptureDepth->Release();
+        if (pPreviousDepth)
+            pPreviousDepth->Release();
+        if (pCaptureTarget)
+            pCaptureTarget->Release();
+        if (pCaptureTexture)
+            pCaptureTexture->Release();
+        pPreviousTarget->Release();
         return 0;
     }
 
-    if (FAILED(pDevice->GetRenderTargetData(pBackBuffer, pOffscreen)) &&
-        FAILED(pDevice->GetFrontBufferData(0, pOffscreen)))
+    pDevice->SetRenderTarget(0, pCaptureTarget);
+    pDevice->SetDepthStencilSurface(pCaptureDepth);
+    FearWorld_Render(pDevice);
+    const HRESULT hrReadback = pDevice->GetRenderTargetData(pCaptureTarget, pOffscreen);
+    pDevice->SetRenderTarget(0, pPreviousTarget);
+    pDevice->SetDepthStencilSurface(pPreviousDepth);
+
+    if (FAILED(hrReadback))
     {
-        printf("FEARRENDER: screenshot failed readback\n");
+        printf("FEARRENDER: screenshot failed readback 0x%08x\n", (unsigned int)hrReadback);
         fflush(stdout);
-        pOffscreen->Release();
-        pBackBuffer->Release();
+        pCaptureDepth->Release();
+        pPreviousDepth->Release();
+        pCaptureTarget->Release();
+        pCaptureTexture->Release();
+        pPreviousTarget->Release();
         return 0;
     }
 
@@ -803,7 +834,11 @@ static int FearRender_MakeScreenShot(const char *pszFilename)
     if (FAILED(pOffscreen->LockRect(&locked, NULL, D3DLOCK_READONLY)))
     {
         pOffscreen->Release();
-        pBackBuffer->Release();
+        pCaptureDepth->Release();
+        pPreviousDepth->Release();
+        pCaptureTarget->Release();
+        pCaptureTexture->Release();
+        pPreviousTarget->Release();
         return 0;
     }
 
@@ -815,7 +850,11 @@ static int FearRender_MakeScreenShot(const char *pszFilename)
     {
         pOffscreen->UnlockRect();
         pOffscreen->Release();
-        pBackBuffer->Release();
+        pCaptureDepth->Release();
+        pPreviousDepth->Release();
+        pCaptureTarget->Release();
+        pCaptureTexture->Release();
+        pPreviousTarget->Release();
         return 0;
     }
 
@@ -834,7 +873,11 @@ static int FearRender_MakeScreenShot(const char *pszFilename)
 
     pOffscreen->UnlockRect();
     pOffscreen->Release();
-    pBackBuffer->Release();
+    pCaptureDepth->Release();
+    pPreviousDepth->Release();
+    pCaptureTarget->Release();
+    pCaptureTexture->Release();
+    pPreviousTarget->Release();
 
     FILE *pFile = fopen(pszFilename, "wb");
     if (!pFile)
@@ -897,6 +940,11 @@ static int FearRender_RenderWorld(void)
 static void FearRender_SetWorldCamera(const float *pPos, float fYaw, float fPitch)
 {
     FearWorld_SetCamera(pPos, fYaw, fPitch);
+}
+
+static void FearRender_SetCameraFov(float fFovX, float fFovY)
+{
+    FearWorld_SetFov(fFovX, fFovY);
 }
 
 static void *FearRender_CreateTextureString(const wchar_t *pszString, const char *pszTypeface, int nHeight, int nStyle)
@@ -970,5 +1018,6 @@ extern "C" const FearRenderApi g_FearRenderApi =
     FearRender_CreateTextureFromRGBA,
     FearRender_RenderWorld,
     FearRender_SetWorldCamera,
+    FearRender_SetCameraFov,
     FearRender_MakeScreenShot
 };

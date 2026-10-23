@@ -1,4 +1,4 @@
-﻿# F.E.A.R. source port plan
+# F.E.A.R. source port plan
 
 Status: the main menu is reached, renders, and supports keyboard/mouse navigation. A new
 single-player game reaches the loading screen for "Interval 01 - Inception" and enters a static
@@ -922,3 +922,505 @@ Remaining blockers for the stated goal:
   present.
 - The `IsMultiplayerExe` patch and version-specific EngineServer offsets remain
   a retail bootstrap dependency until the source-side server is implemented.
+
+## Iteration 10 status
+
+Completed since iteration 9:
+
+- Local-player path: `CPlayerCamera::InitLocalPlayer` runs end to end. The host
+  issues the `SFX_CHARACTER_ID` factory request with
+  `hModel = ModelsDB::GetModelByRecordName("Player")` (matching
+  `PlayerBodyMgr::ResetModel`), the guard scope lets the character FX factory
+  resolve the client object, and the port camera is prepared with
+  `kCM_FirstPerson` on the server player target.
+  Evidence: `local character modelsdb=... model=...`,
+  `local character fx created for ...`, `port camera ready ... localplayer=1`.
+- Camera: the transform is read from the player object instead of the preview
+  defaults, and the world camera follows it every frame.
+- Frame capture: `ILTRenderer::MakeScreenShot` renders the world into an
+  offscreen render target, copies it to a system surface and writes a 32-bit
+  BMP. The back-buffer readback path cannot be used because the v4 host does
+  not expose a readable back buffer. `FEAR_CAPTURE_FRAME` selects the frame.
+- Log volume: per-message and per-frame logging is rate limited, which removes
+  the ~170k line log storms that were being produced by the server message and
+  render loops.
+- `tools/parity_check.py` implements the acceptance metrics (channel
+  tolerance percentage, MAE, luma SSIM, CIEDE2000) and self-validates the
+  colour math, so parity numbers are now reproducible.
+
+Known defect carried forward:
+
+- `Critical error, no Null weightset on Character!  Missing: null`. The
+  character FX object is created and attached, but `MODL` parsing is still
+  stubbed, so the animation sets have no data. Either real `MODL` version 33
+  parsing or a guarded `InitAnimations` is required before models can render.
+
+Next order of work:
+
+1. Obtain a retail reference frame for the same mission, camera and settings,
+   then run `tools/parity_check.py` to replace estimates with a measured gap.
+2. Locate the static lighting data. The `World00p` header exposes render,
+   light-grid, property/object and particle-blocker positions; the BSP and
+   lightmap payload lives in the first ~10 MB of the file, before the render
+   block. The last 92 KB of the render block is an index-ordered record table
+   (36-byte stride) whose role is still unidentified.
+3. `MODL` version 33 for characters, weapons and world props.
+4. `.fxo` material shaders, then fog and post-processing.
+5. Message routing: deliver `MID_SFX_MESSAGE` sub messages through
+   `IClientShell::SpecialEffectNotify` instead of filtering them, keeping the
+   synthetic character creation as a fallback.
+
+
+## Iteration 11 status
+
+Camera projection now uses the client's own FOV instead of a constant.
+
+- `ILTClient::SetCameraFOV` / `GetCameraFOV` were inert stubs. They now store the
+  values and forward them through a new `FearRenderApi::SetCameraFov` entry to
+  `FearWorld_SetFov`.
+- Verified in `fear_port_run.log` on the first mission:
+  `FEARWORLD: camera fov x=1.5936 rad (91.3 deg) y=1.3090 rad (75.0 deg)`.
+  These are the values `PlayerCamera` computes for 1024x768, not constants.
+- The renderer derives the aspect ratio as `tan(fovX / 2) / tan(fovY / 2)` and
+  falls back to 4:3 only when the client has not set a FOV yet. The previous
+  code hard-coded `1.2 rad` (68.8 deg) vertical with a 4:3 aspect, so the field
+  of view was visibly narrower than retail.
+- Capture re-verified after the change: 1024x768, mean luma 82.4, mean 32x32
+  block standard deviation 22.1, 98.4% of pixels non-black, no new errors in the
+  log. The only remaining diagnostic is the known `no Null weightset` message.
+- Measured against the previous capture (`port_materials.bmp`) the framing change
+  scores match 11.74%, MAE 75.77, SSIM 0.156, CIEDE2000 mean 28.90 / p95 56.03.
+  Those numbers only quantify the FOV delta; the parity gap to retail still needs
+  a retail reference frame.
+
+Remaining blocker for the next visible step is unchanged: the lighting payload.
+`LightPointFill` (5) and `LightCube` (3) objects exist in the object block, but
+a scan of the whole block recovers only 142 objects out of a 2.5 MB section, so
+the object stream framing is still not decoded well enough to drive lighting
+from it. The next attempt should read the object stream through the retail
+server, which already parses it, rather than continuing byte-level guessing.
+
+## Iteration 12 status
+
+The object-stream blocker above is resolved. The framing was decoded from an
+independent Jupiter EX implementation (`LithtechLokiResearch`), not by guessing:
+
+- For FEAR (world version 113) the eight world-model counters are XOR-ed with
+  399 after reading. That single detail is what defeated every byte-level
+  attempt; it also explains why the earlier scan stalled at 142 objects.
+- Object record: `uint16`-prefixed class name, `int32 propertyCount`,
+  `int32 blobLength` plus blob, then per property `int32 nameOffset`,
+  `int32 type` and exactly four payload bytes. `String`/`Text`/`CommandString`
+  payloads index a blob string; `Vector3`, `Color` and `Rotation` index blob
+  floats (3/3/4); `Float`, `Bool` and `Int` are the four bytes inline.
+
+The C++ parser now agrees with an independent Python reference on
+`Worlds\Release\Intro.World00p`: 1988 of 1988 objects, `LightPoint=35`,
+`LightSpot=12`, `LightDirectional=2`, `LightCube=39`, `max_radius=3000`,
+`AmbientLight=(25,25,25)` and `GameStartPoint00=(-1100,-1436,-370)` — the exact
+position the retail server spawns the player at. The lights and world properties
+are stored but not yet consumed by `FearWorld_Render`.
+
+Vertex decoding is now table-driven. The file declares 11 vertex types; each is
+expanded into `(stride, uvOffset, normalOffset, colorOffset)` by accumulating
+property formats in declaration order, and each surface binds through its
+`vertexType` field. The derived strides match the recorded per-surface
+`vertex_size` for 2267 of 2268 surfaces. 2096 surfaces have normals and 250 have
+baked RGBA colour; both are uploaded, but `D3DRS_LIGHTING` stays off, because
+F.E.A.R. world shading comes from material lightmaps rather than vertex colour
+and enabling fixed-function lighting naively darkens the frame from mean luma
+77 to under 10.
+
+Face culling is now measured rather than assumed: `D3DCULL_CW` collapses mean
+luma from 76.9 to 37.7 and loses a tenth of the frame, while `D3DCULL_CCW` keeps
+the scene and only removes back faces, so `CCW` is the default and
+`FEAR_CULL=none|cw` is the override.
+
+Next: feed `g_WorldLights` into the renderer together with the material lightmap
+stage, which is the missing term — geometry, projection, culling and the object
+layer are now all decoded from the real data.
+
+## Iteration 13 status
+
+The material question is now answered from the data instead of assumed, and the
+answer removes a large unknown from the lighting plan.
+
+`FEAR_MATDUMP=1` dumps every parameter of the first twelve world materials. The
+`.Mat00` layout in `FEAR/Compat/cshell/fear_world.cpp` was confirmed correct
+end-to-end: magic `LTMI`, version, `uint16`-prefixed shader path, `uint32`
+parameter count, then typed parameters. The shader path is a real quirk asset,
+for example `Shaders\rigid\Prototype\specular_mirror.fx`.
+
+A typical world material carries no lightmap stage at all:
+
+```
+Materials\Tech\Research\Tile_Mirror01.Mat00
+  shader = Shaders\rigid\Prototype\specular_mirror.fx
+  tDiffuseMap          = Materials\Tech\Research\Tile_DarkMirror_D.dds
+  tEmissiveMap         = Tex\specular_black.dds
+  tSpecularMap         = Tex\Office\Floor01_S.dds
+  tNormalMap           = Tex\Office\Floor01_N.dds
+  tReflectionMap       = Tex\specular_black.dds
+  tReflectionMapMask   = Materials\Tech\Research\Tile_Dark_S.dds
+```
+
+F.E.A.R. world shading is therefore a dynamic per-pixel lighting model driven by
+the `.fx` shaders and the scene light list, not a baked lightmap stage inside
+the material. That is consistent with the earlier measurements: only 250 of 2268
+surfaces carry baked vertex colour, and enabling fixed-function lighting just
+turns the frame black. Two consequences for the port:
+
+* `g_WorldLights` (35 point, 12 spot, 2 directional, 39 cube) is the real
+  lighting input and must eventually be evaluated per pixel by a shader.
+* The material texture must be chosen by name. The former heuristic took the
+  first `.dds` value in the parameter list, which happens to be `tDiffuseMap`
+  for every sampled material but is not guaranteed. `FearReadMaterialTexture`
+  now prefers `tDiffuseMap` explicitly and only falls back to the first `.dds`
+  parameter when it is absent.
+
+Verification of the change: `surfaces=2268 materials=508 used_materials=457`
+unchanged, and the captured frame is unchanged at `mean=77.1 std=64.4
+blockstd=59.7 nonblack=97.5% colors=65893`, confirming the heuristic was already
+picking the right map for this world.
+
+### Light baking is measured, and it is not the missing term
+
+`FEAR_LIGHTS=1` enables a CPU bake that evaluates every decoded light against the
+decoded vertex normal and writes the result into the vertex diffuse colour
+(`ambient + sum(colour * max(0, N.L) * (1 - d/r)^2)`, clamped). It runs over all
+88 lights and 175 065 vertices at load time.
+
+Measured result: `mean=16.2 std=6.8 blockstd=5.5 nonblack=97.4% colors=10285`.
+The frame collapses to near black. The reason is structural, not a bug: the world
+ambient is only `(25,25,25)` out of 255, the point/spot lights have radii on the
+order of 300 inside level bounds that span roughly `65000 x 4300 x 41500` units,
+and the two directional lights are the ones that would carry the broad fill. So
+the light list alone cannot stand in for the `.fx` lighting model.
+
+The bake therefore ships **off by default** and behind `FEAR_LIGHTS=1`, so the
+measured `mean=77.1 colors=65893` baseline is preserved exactly. The remaining
+work is a real pixel shader that reproduces the prototype shading path
+(diffuse x normal-mapped specular lighting x emissive x reflection mask); the
+data it needs — positions, normals, tangents, UVs, material maps and the light
+list — is now all decoded.
+
+## Iteration 14 status
+
+The per-pixel world shader is implemented and now matches the fixed-function
+reference within measurement noise, while adding the per-pixel terms
+fixed-function cannot express.
+
+### Two defects blocked the first attempts
+
+**Constant register collision.** D3D9 HLSL assigns constant registers in
+declaration order, and a shader *file* shares one assignment scheme across the
+vertex and pixel entry points even though the two register spaces are
+independent. Once the pixel-side light arrays were pinned to `register(c4)`,
+`register(c12)`, `register(c20)` and `register(c28)`, the vertex matrix
+`g_WorldViewProj` was allocated at **c36-c39** while the CPU uploaded it to c0.
+Every vertex was transformed by garbage, the shader drew nothing, and the frame
+fell back to the clear colour. The fix is explicit pinning on both sides:
+
+```
+row_major float4x4 g_WorldViewProj : register(c0);
+```
+
+Verified by compiling with `fxc /T vs_3_0 /E FearVS /Fc out.asm` and reading the
+live range, which now reports `g_WorldViewProj c0 4`. Any shared uniform in a
+D3D9 HLSL file must be pinned explicitly.
+
+**`FearEnvFloat` discarded zero.** The helper returned the default whenever the
+parsed value was not strictly positive, so `FEAR_NORMALMAP=0` silently kept
+normal mapping on and the A/B test produced byte-identical frames. It now
+returns the parsed value whenever the variable is present and non-empty.
+
+### The actual lighting model
+
+The decisive measurement is that `diffuse_texture * vertex_colour` reproduces the
+fixed-function reference almost exactly: mean ratio `1.011` at the fiftieth
+percentile of a 16x16 block grid, with no exposure term at all. The vertex colour
+already contains the engine's own baked shading — `FearShadeVertex` accumulates
+ambient plus every decoded light (`ambient + sum(colour * max(0, N.L) * (1 - d/r)^2)`,
+clamped) across all 88 lights.
+
+A shader that recomputes lighting from only the 8 lights selected per batch
+therefore cannot reproduce that result, and it is the reason the first working
+version was simultaneously too dark in the midtones and too bright near lamps.
+The shader now uses the baked vertex colour as the diffuse term and adds only
+what fixed-function cannot do per pixel:
+
+```
+albedo = tex2D(g_Diffuse, uv).rgb * lerp(1, i.Color.rgb, g_Tint.a)
+N      = cotangent-frame perturbed normal (tangent-space normal map)
+light  = ambient + sum(select_lights)          // 8 nearest of 88
+spec   = sum(lc * pow(saturate(N.H), 24)) * g_Params.w
+colour = albedo * lerp(light, 1, g_Tint.a) + spec * specularMap + emissive
+colour = ACES(colour * exposure)
+```
+
+`g_Tint.a` is the `FEAR_VCOL` blend: `1.0` uses the baked vertex lighting for the
+diffuse term, `0.0` uses the recomputed per-pixel lights. The default is `1.0`
+because that is the measured-correct path; the per-pixel lights still drive the
+specular term and the normal-map perturbation in both modes.
+
+Tone mapping is the ACES approximation `c * (2.51c + 0.03) / (c * (2.43c + 0.59) + 0.14)`.
+Linear exposure was the wrong tool: raising it to reach the reference midtones
+pushed 12% of pixels above 250/255, because a linear gain cannot lift the
+midtones without clipping the highlights. ACES keeps the whole frame inside the
+range instead.
+
+### Measured result
+
+Compared against the fixed-function reference (`ref_ff.bmp`, frame 60,
+1024x768) with a per-16x16-block brightness-ratio distribution:
+
+| Variant | mean | std | colours | corr | ratio p10 / p50 / p90 | clipped |
+|---|---|---|---|---|---|---|
+| fixed-function reference | 76.83 | 64.4 | 65893 | - | - | 0.38% |
+| linear exposure, no tone curve | 47.7 | 41.0 | 41493 | 0.7267 | 0.392 / 0.412 / 1.050 | 0.07% |
+| linear exposure 2.6 | 96.1 | 85.9 | 83579 | 0.8986 | - | 12.38% |
+| **ACES, exposure 0.72** | **77.15** | **59.7** | **63180** | **0.9849** | **0.917 / 0.993 / 1.080** | **0.00%** |
+
+The shader frame is 0.5% brighter than the reference, the block-ratio
+distribution is centred on `0.993` with a 12% p10-p90 spread, and nothing
+clips. The remaining `std` difference (`59.7` against `64.4`) is the ACES
+shoulder compressing the brightest region.
+
+### Normal maps and specular are subtle by content, not by bug
+
+`FEAR_NMDUMP=1` now reports each decoded texture's dimensions, DDS FourCC and
+per-channel mean and standard deviation. The world's normal maps really are
+nearly flat: `Tex\Office\Floor01_N.dds` is `(127.0, 127.0, 253.9)` with a
+standard deviation of `5.0` on the two tangent axes, i.e. the surfaces are
+architectural planes whose normals tilt by about two degrees. Disabling normal
+mapping changes 73 of 63180 unique colours and no measurable statistic, which is
+the expected result for that content rather than a dead code path. The path is
+verified working: the textures load (397 of 457 used batches have one), decode
+to valid tangent-space values near `(0.5, 0.5, 1.0)`, and the cotangent frame is
+built from `ddx`/`ddy`.
+
+Specular is measurable but small at this camera: `FEAR_SPECULAR=0` lowers the
+mean from `77.15` to `76.61`. Most world materials point at
+`Tex\specular_black.dds`, so the term only appears on the subset with a real
+specular map.
+
+### Diagnostic flags
+
+The bisection scaffolding (`FEAR_MINIMAL`, `FEAR_VSDBG`, `FEAR_NOPS`,
+`FEAR_MTX`, `FEAR_PROBE`) was removed once the root cause was understood.
+The remaining knobs are the ones that matter for tuning and asset inspection:
+`FEAR_SHADER=0`, `FEAR_SHADERDBG=1`, `FEAR_AMBIENT`, `FEAR_EXPOSURE`,
+`FEAR_SPECULAR`, `FEAR_NORMALMAP`, `FEAR_VCOL`, `FEAR_TONE`, `FEAR_CULL`,
+`FEAR_MATDUMP`, `FEAR_LIGHTDUMP`, `FEAR_LIGHTS` and `FEAR_NMDUMP`.
+
+## Iteration 15 status
+
+Iteration 15 adds the model pass: `FEAR/Compat/cshell/fear_model.cpp` decodes
+MODL containers, uploads them into a D3D9 vertex and index buffer, and draws
+them with a dedicated vertex and pixel shader from inside `FearWorld_Render`.
+
+### The MODL container
+
+`modl.py` and the C++ loader now agree on the layout. The geometry block starts
+with an eight byte header holding `vertexBytes` and `faceBytes`; the vertex
+records follow at `+8` and the faces immediately after them. Every F.E.A.R.
+model found so far uses a 32 byte vertex record:
+
+| Offset | Type | Meaning |
+|---|---|---|
+| 0 | `float3` | position |
+| 12 | `float3` | normal (unit length) |
+| 24 | `u32` | per-corner flag, `0` or `1` |
+| 28 | `u32` | constant per file (`0x00F6F61C` on the submachine gun) |
+
+The two trailing words were measured over all record counts, not sampled. On
+`SubMachineGun` the word at `+28` holds `0x00F6F61C` in **all 6396** records,
+so it is a file-level id or stamp and never per-corner data. The word at `+24`
+takes only two values: `0` in 6288 records and `1` in 108, which is a flag —
+most plausibly "this corner belongs to the second UV/material split".
+
+**There is no texture coordinate stream.** A statistical sweep of the whole
+file for float pairs inside `[0,1]` finds an unbroken run of `2 * numVerts`
+floats immediately after the vertex block, but that run is the 16 bit face
+index array read as float32: any index below about 2^30 is a denormal and
+therefore lands inside `[0,1]`. Excluding that, the submachine gun, the helmet
+and the spectral girl all have zero UV data anywhere in the container. The
+`+24` flag being `0` or `1` supports the same reading: LithTech stores the
+texture coordinates in the mesh's vertex format, and this decoder only reaches
+the position and normal portion of it. Material assignment and UV recovery are
+therefore a separate piece of reverse engineering and are **not** required for
+the geometry to draw.
+
+Character records are a caveat. The stride is inferred as `vertexBytes /
+numVerts`, guided by the largest face index, which yields 64 on `SpectralGirl`
+with zero slack — so 64 is almost certainly the real record size. But offset
+12 inside that record is *not* a normal: it has a length of about 40 on that
+file and is bit-identical to the position of the following record. The
+character profile therefore carries extra `vec3` rows between the position and
+the next corner, and only the position at offset 0 is currently understood.
+
+This does not corrupt the render, because `FearModelBuildGeometry` measures the
+mean squared length of the stored normals and falls back to face-derived
+normals whenever it is outside `0.9..1.1`. A profile mismatch degrades into
+recomputed normals instead of a broken mesh — do not "fix" the stride before
+the extra rows are decoded, or the slack check that keeps the decode honest
+will start picking the wrong stride.
+
+The face array is a plain list of 16 bit index triples, but three of every four
+triangles are geometrically degenerate: on the submachine gun 6396 of 8528
+triangles have two coincident corners. The decoder therefore drops any triangle
+whose cross product length is below `1e-5` at load time. On `SubMachineGun` this
+reduces 8528 triangles to 2132 and changes the rendered frame by exactly zero
+pixels, so the filter is a pure optimisation and not a topology change. The
+2132 surviving triangles form a correct submachine gun silhouette when rendered
+offline in an orthographic side view.
+
+### The shader path and the `row_major` trap
+
+The model pass runs a vertex and pixel shader pair compiled at runtime with
+`d3dcompiler_47.dll`. Lighting is evaluated entirely in the vertex shader
+because `ps_3_0` addresses only 224 constant registers (`c0`-`c223`) while
+`vs_3_0` has 256, so the world shader's `c0`-`c36` block and the model's
+`c240`-`c245` block can only coexist if the model constants stay out of the
+pixel shader.
+
+The single defect that cost the most time in this iteration was the matrix
+declaration. The world shader declares its matrix as
+`row_major float4x4 g_WorldViewProj`; the model shader originally declared
+`float4x4 g_WVP` without the qualifier. HLSL then treats the matrix as
+**column major**, which silently transposes a matrix uploaded with
+`SetVertexShaderConstantF` and destroys the `w` component, so the model
+projected to a full height vertical band instead of a gun. The symptom looks
+like broken geometry, so it is worth remembering: an uploaded matrix that
+produces absurd screen coverage is almost always transposed, not miscomputed.
+
+### State hygiene
+
+`FearModel_RenderQueued` saves and restores render states, world/view/projection
+transforms, FVF, vertex declaration, shaders, texture stage states for all four
+stages and the stage 0 texture, then rebinds every one of them. The pass was
+validated with `FEAR_MODEL_NODRAW=1`, which performs every state change but
+skips the draw call: the resulting frame is bit identical to a capture with no
+model at all, which proves the save and restore are complete. Texture stages 2
+and 3 were the last leak - stages 0 and 1 were handled from the start but the
+world shader uses all four.
+
+### Measured result
+
+| Capture | corr vs `ref_ff.bmp` | changed px | bbox |
+|---|---|---|---|
+| no model (baseline) | 0.9849 | 0 | - |
+| `SubMachineGun`, depth off | 0.9640 | 32566 | 332-691 x 281-487 |
+| `SubMachineGun`, no draw | 0.9849 | 0 | - |
+| `bomb`, depth off | 0.9386 | 45787 | 346-678 x 300-450 |
+| `helmet`, depth off | 0.9199 | 73470 | 371-653 x 213-555 |
+| `SpectralGirl`, depth off | 0.9808 | - | narrow vertical |
+
+The predicted screen box from the CPU side transform (`ndcbox` in the
+`FEARMODEL: draw` log line) matches the observed pixel box to within one
+16x16 block, so placement, projection and aspect handling are correct. The
+debug model is occluded by the world when depth testing is on, which is
+expected: it is parked 170 units in front of the camera and the intro world has
+geometry in between. `FEAR_MODEL_ZTEST=0` draws it through the world for
+inspection.
+
+The model is flat grey because the material and texture chain is not wired up
+yet. `g_Tint` in `c245` supplies a neutral albedo and the vertex shader applies
+a directional light with a 0.25 wrap term, which gives a luma spread of 40 to
+170 across the silhouette. Real `.dtx` materials are a later iteration.
+
+### Diagnostic flags
+
+`FEAR_DEBUG_MODEL` (base name), `FEAR_MODEL_DIR`, `FEAR_MODEL_DIST`,
+`FEAR_MODEL_SIZE`, `FEAR_MODEL_YAW`, `FEAR_MODEL_POINTS`, `FEAR_MODEL_TRIS`,
+`FEAR_MODEL_ZTEST`, `FEAR_MODEL_FF`, `FEAR_MODEL_DEBUGN`, `FEAR_MODEL_NODRAW`.
+
+### Regression check
+
+The whole model subsystem is inert unless `FEAR_DEBUG_MODEL` is set, so the
+world pass must be bit-identical with it unset. Confirmed against the
+pre-change baseline capture:
+
+| Build | Capture | `corr` vs `ref_ff.bmp` | max pixel diff vs old baseline |
+|---|---|---|---|
+| final | `mdl_base2` (no model) | 0.9849 | 0 |
+
+The `g_Tint` lighting change was re-measured on the two models that were first
+captured with the old double-shaded path:
+
+| Model | before `g_Tint` | after `g_Tint` |
+|---|---|---|
+| `bomb` | 0.9386 | 0.9417 |
+| `helmet` | 0.9199 | 0.9188 |
+
+Both are within noise of each other, so the vertex-shader rewrite is a pure
+quality change and did not alter placement, culling or coverage.
+
+## Iteration 16 status
+
+Iteration 16 recovered the player control path end to end. The chain
+`CGameClientShell::Update -> UpdatePlaying -> UpdatePlayerMovement ->
+CMoveMgr::Update` now runs every frame with real input, real velocity and
+non-zero movement.
+
+### Root causes found and fixed
+
+1. **Instrumentation was measuring a dead copy of the sources.** The client
+   target builds `FEAR Public Tools 1.08\Source\Game\ClientShellDLL\*.cpp`, not
+   `lithtech\FEAR\ClientShellDLL\*.cpp`. Every diagnostic counter added to the
+   latter tree was a no-op, which is why `movepipe update=0` looked like
+   "Update is never called". After instrumenting the real tree the counters
+   showed `update=1015 bail=1015`: `CMoveMgr::Update` was called every frame and
+   bailed immediately.
+2. **`ILTClient::GetClientObject()` returned NULL.** `Stub_GetClientObject_31`
+   gates the result behind `FEAR_LOCAL_PLAYER=1` (or local-player scope), and
+   the autostart soaks never set it. With the variable set the client object
+   resolves (`local server object id=2032 resolved=...`) and `bail` drops to 0.
+3. **`CFearPhysics` implemented only `ILTPhysics`.** `CMoveMgr` casts
+   `g_pPhysicsLT` to `ILTClientPhysics*` and calls `UpdateMovement`, which sat
+   past the end of the smaller vtable and jumped to `00000000`. `CFearPhysics`
+   now derives from `ILTClientPhysics` and implements `UpdateMovement`,
+   `MovePushObjects` and `RotatePushObjects`.
+4. **`UpdateMovement` filled the wrong output.** `MoveInfo` is
+   `{ m_hObject, m_dt, m_Offset }`; `CMoveMgr` reads `m_Offset` and applies it
+   itself via `MoveObject`. The first implementation moved the object directly
+   and left `m_Offset` as uninitialised stack (`0xCCCCCCCC`), so `CMoveMgr` added
+   ~-1e8 per frame to the player position. It now integrates velocity into
+   `m_Offset` only.
+5. **`ILTPhysics::MoveObject` is a teleport, not a translate.** It sets the
+   absolute position; adding the argument to the current position doubled the
+   player position every frame.
+6. **Object getters left outputs untouched on failure.** FEAR code ignores the
+   `LTRESULT` and forwards the stack garbage. `GetObjectPos`,
+   `GetObjectRotation` and both `GetObjectTransform` overloads now always write
+   their outputs (zeros / identity) and only then report `LT_NOTFOUND`. All
+   setters reject non-finite or absurd values so garbage can never enter the
+   object map.
+7. **The player had no ground contact.** `CMoveMgr::UpdateOnGround` sets
+   `m_bOnGround` only when `CollisionInfo::m_hObject` is non-null and the plane
+   normal is above `0.707`. `GetStandingOn` now reports a synthetic ground
+   object (`FearClient_GetGroundObject`) with an up normal, so friction, gravity
+   and jump gating behave.
+
+### Verified behaviour
+
+Soak `inp33` / `walk2` (`FEAR_AUTOSTART=1;FEAR_LOCAL_PLAYER=1;FEAR_AUTOWALK=420,820`):
+
+- `core` counters: `movepipe update=1195 bail=0 flags=1195 normal=1195 vel=1195`.
+- Input reaches the bind manager: `forward=1` while the key is held.
+- Motion: `movemgr vel=0,0,440` and `pos.z` advances 44 units per 0.1 s frame
+  while walking, then decays to zero when the key is released (`onground=1`).
+- Rendered frames captured during the walk differ by 27 gray levels between
+  consecutive captures while moving and by 7 after stopping, i.e. the camera
+  really travels with the player.
+
+### Still open
+
+- The retail server never sees the movement: `srvplayer pos=-1100.00 -1436.00
+  -370.00` stays at the spawn while the client-side player moves. Client
+  messages `id=100` / `id=2` do reach `FearServerHost_SubmitClientMessage` but
+  do not move the authoritative player.
+- `ILTClient::IntersectSegment` is still a stub, so there is no world collision
+  on the predicted path (the player can walk through geometry).
+- Nothing yet plays the intro cutscene, and the third-person player body is
+  created but not animated.

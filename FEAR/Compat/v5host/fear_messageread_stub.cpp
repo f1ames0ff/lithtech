@@ -239,9 +239,29 @@ LTRotation CFearMessageRead::ReadYRotation()
     return ReadCompLTRotation();
 }
 
-HRECORD CFearMessageRead::ReadDatabaseRecord(IDatabaseMgr *, HCATEGORY)
+static void gos_LogDbRecord(uint32 nIndex, HCATEGORY hCategory, HRECORD hRecord, int nUnused)
 {
-    return (HRECORD)(uintptr_t)ReadBits(16);
+    (void)nUnused;
+    static int s_nLogs = 0;
+    if (s_nLogs >= 24)
+        return;
+    ++s_nLogs;
+    printf("FEARPORT: db record index=%u cat=%p rec=%p\n",
+        (unsigned)nIndex, (const void *)hCategory, (const void *)hRecord);
+}
+
+HRECORD CFearMessageRead::ReadDatabaseRecord(IDatabaseMgr *pDatabase, HCATEGORY hCategory)
+{
+    uint32 nIndex = ReadBits(16);
+    if (!pDatabase || !hCategory || nIndex == 0xFFFF)
+    {
+        gos_LogDbRecord(nIndex, NULL, NULL, 0);
+        return NULL;
+    }
+
+    HRECORD hRecord = pDatabase->GetRecordByIndex(hCategory, nIndex);
+    gos_LogDbRecord(nIndex, hCategory, hRecord, 0);
+    return hRecord;
 }
 
 LTPolarCoord CFearMessageRead::ReadCompLTPolarCoord()

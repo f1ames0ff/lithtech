@@ -6,6 +6,7 @@ set(FEAR_CSHELL_SOURCES
     cshell_object.cpp
     cshell_render.cpp
     fear_world.cpp
+    fear_model.cpp
     dds_loader.cpp
     ${CMAKE_SOURCE_DIR}/sdk/inc/ltmodule.cpp
     ${CMAKE_SOURCE_DIR}/sdk/inc/ltobjref.cpp)

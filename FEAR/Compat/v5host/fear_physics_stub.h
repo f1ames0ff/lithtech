@@ -4,7 +4,7 @@
 #include "ltbasedefs.h"
 #include "iltphysics.h"
 
-class CFearPhysics : public ILTPhysics
+class CFearPhysics : public ILTClientPhysics
 {
 public:
     declare_interface(CFearPhysics)
@@ -30,6 +30,10 @@ public:
     LTRESULT GetStandingOn(HOBJECT hObj, CollisionInfo *info) override;
     LTRESULT GetGlobalForce(LTVector &a) override;
     LTRESULT SetGlobalForce(const LTVector &a) override;
+
+    LTRESULT UpdateMovement(MoveInfo *pInfo) override;
+    LTRESULT MovePushObjects(HOBJECT hToMove, const LTVector& p, HOBJECT* hPushObjects, uint32 nPushObjects) override;
+    LTRESULT RotatePushObjects(HOBJECT hToMove, const LTRotation& q, HOBJECT* hPushObjects, uint32 nPushObjects) override;
 };
 
 extern CFearPhysics g_FearPhysics;

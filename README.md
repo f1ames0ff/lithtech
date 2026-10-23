@@ -38,10 +38,13 @@ object handles are mapped to the client.
 | v5 server bootstrap | Works |
 | First mission startup | `GS_PLAYING`, player Alive, `Worlds\Release\Intro` |
 | Player camera | Wired to the server player transform |
+| Camera projection | Uses the client's `SetCameraFOV` values (91.3° x 75.0° at 1024x768) |
+| Local player character | Character FX created, `MODL` data still stubbed |
 | Playable movement / collision | Not yet |
 | HUD / weapons | HUD draws; weapons and player values incomplete |
-| v113 renderer | Textured material batches; lighting and shadows missing |
+| v113 renderer | Table-driven vertex decoding, `CCW` culling, 1988/1988 world objects parsed; lightmaps and shadows missing |
 | 95% visual parity | Not yet measured or reached |
+| Parity measurement | `tools/parity_check.py` (SSIM, CIEDE2000, channel tolerance) |
 | Source-only v5 server | Not yet |
 
 ## Architecture
@@ -133,24 +136,28 @@ and is not part of the repository or the final runtime.
 | `FEAR/Compat/cshell` | v4-to-v5 host proxy and v113 world preview |
 | `FEAR/Compat/publictools_client` | source-client exports and startup/preload hooks |
 | `runtime` | Lithtech engine |
-| `tools` | build, stage, desktop and inspection scripts |
+| `tools` | build, stage, desktop, inspection and parity scripts |
+| `tools/parity_check.py` | visual parity metrics: channel tolerance, MAE, SSIM, CIEDE2000 |
 | `docs/FEAR_PORT_PLAN.md` | architecture, milestones and reverse-engineering log |
 | `docs/FEAR_ACCEPTANCE.md` | first-mission and visual-parity acceptance gates |
 | `BUILD_WINDOWS.md` | Windows build and staging instructions |
 
 ## Next work
 
-1. Map the v5 database records and server object handles to client-side objects, then remove the
-   safe-message filter and restore the local `CCharacterFX`/move-manager path, HUD values,
-   weapons and movement state.
-2. Bind `GetClientObject` to the local player and finish the object replication path; the camera
-   is already driven by the server player transform.
-3. Restore v113 lightmaps, surface lighting, `.fxo` shaders and shadow volumes; the material and
-   DDS texture path is already implemented.
-4. Port the MODL 33 model loader, animation and HUD services, using the retail renderer as the
-   reference.
-5. Replace the retail server bootstrap with a source-side v5 server.
-6. Run the fixed-camera retail/port comparison at 640×480 and report the 95% parity gate honestly.
+1. Capture a retail reference frame of Interval 01 at a fixed camera and run
+   `tools/parity_check.py` against the port frame, so the parity gap stops being an estimate.
+2. Restore v113 static lighting. The object section is now fully decoded: FEAR XORs the eight world
+   model counters with 399, and each object record frames a `uint16`-prefixed class name, a
+   property count, a blob and four payload bytes per property. The C++ parser reads all 1988 objects
+   in `Intro.World00p` and recovers 35 point, 12 spot, 2 directional and 39 cube lights plus
+   `AmbientLight=(25,25,25)`. The missing term is the material lightmap stage, not the light list.
+3. Port the MODL 33 model loader, animation and HUD services, using the retail renderer as the
+   reference. This also clears the `no Null weightset on Character` error.
+4. Restore `.fxo` shaders, fog, shadow volumes and post-processing on top of the material and DDS
+   texture path that already works.
+5. Map the v5 database records and server object handles to client-side objects, then remove the
+   safe-message filter and finish movement, collisions, weapons and HUD values.
+6. Replace the retail server bootstrap with a source-side v5 server.
 
 ## Provenance
 

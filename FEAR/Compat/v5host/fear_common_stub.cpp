@@ -1,4 +1,5 @@
 #include "fear_common_stub.h"
+#include "fear_object_map.h"
 #include "fear_messagewrite_stub.h"
 #include <stdio.h>
 
@@ -22,14 +23,20 @@ LTRESULT CFearCommon::SetObjectFilenames(HOBJECT hObj, ObjectCreateStruct* pStru
 
 LTRESULT CFearCommon::GetObjectFlags(const HOBJECT hObj, const ObjFlagType flagType, uint32 &dwFlags)
 {
-    printf("STUB ILTCommon::GetObjectFlags\n");
-    return SvcDefault<LTRESULT>::Get();
+    uint32 nFlags = 0;
+    if (!FearClient_GetObjectFlags(hObj, (unsigned int)flagType, &nFlags))
+        return LT_NOTFOUND;
+
+    dwFlags = nFlags;
+    return LT_OK;
 }
 
 LTRESULT CFearCommon::SetObjectFlags(HOBJECT hObj, const ObjFlagType flagType, uint32 dwFlags, uint32 dwMask)
 {
-    printf("STUB ILTCommon::SetObjectFlags\n");
-    return SvcDefault<LTRESULT>::Get();
+    if (!FearClient_SetObjectFlags(hObj, (unsigned int)flagType, dwFlags, dwMask))
+        return LT_NOTFOUND;
+
+    return LT_OK;
 }
 
 LTRESULT CFearCommon::GetAttachmentObjects(HATTACHMENT hAttachment, HOBJECT &hParent, HOBJECT &hChild)

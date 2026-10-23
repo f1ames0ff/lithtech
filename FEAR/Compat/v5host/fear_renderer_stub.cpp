@@ -213,14 +213,22 @@ LTRESULT CFearRenderer::ScreenPosToWorldPos(HOBJECT hCamera, const LTVector2& vS
 
 LTRESULT CFearRenderer::RenderCamera(HLOCALOBJ hCamera, const char *pTechniqueOverride)
 {
-    FEAR_FWD_LOG("ILTRenderer::RenderCamera");
     const FearRenderApi *pRender = FearRender();
     if (!pRender || !pRender->RenderWorld)
         return LT_UNSUPPORTED;
 
     float position[3] = {0.0f, 0.0f, 0.0f};
     float rotation[4] = {0.0f, 0.0f, 0.0f, 1.0f};
-    if (hCamera && FearClient_GetObjectTransform(hCamera, position, rotation) && pRender->SetWorldCamera)
+    bool bHaveTransform = hCamera && FearClient_GetObjectTransform(hCamera, position, rotation);
+    static int s_nCamLog = 0;
+    ++s_nCamLog;
+    if (s_nCamLog == 1 || (s_nCamLog % 300) == 0)
+    {
+        printf("FEARRENDER: camera h=%p transform=%d pos=(%.1f %.1f %.1f)\n",
+            (void *)hCamera, bHaveTransform ? 1 : 0, position[0], position[1], position[2]);
+        fflush(stdout);
+    }
+    if (bHaveTransform && pRender->SetWorldCamera)
     {
         const float qx = rotation[0];
         const float qy = rotation[1];

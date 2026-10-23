@@ -5,8 +5,16 @@
 #include "ClientConnectionMgr.h"
 #include "PlayerMgr.h"
 #include "PlayerCamera.h"
+#include "SFXMgr.h"
+#include "CharacterFX.h"
+#include "SharedFXStructs.h"
 #include "MsgIDs.h"
 #include "AutoMessage.h"
+#include "ModelsDB.h"
+#include "NetDefs.h"
+#include "CMoveMgr.h"
+#include "BindMgr.h"
+#include "CommandIDs.h"
 
 extern void UnhookWindow();
 
@@ -87,6 +95,46 @@ extern "C" __declspec(dllexport) int FearClient_PreparePortPlayer(void *hTarget)
     return 1;
 }
 
+static HOBJECT g_hLocalCharacter = NULL;
+
+extern "C" __declspec(dllexport) int FearClient_CreateLocalCharacter(void *hObject)
+{
+    if (!g_pGameClientShell || !hObject)
+        return 0;
+
+    CSFXMgr *pSFXMgr = g_pGameClientShell->GetSFXMgr();
+    if (!pSFXMgr)
+        return 0;
+
+    HOBJECT hServerObj = (HOBJECT)hObject;
+    if (pSFXMgr->GetCharacterFX(hServerObj))
+        return 1;
+
+    CHARCREATESTRUCT charCreate;
+    charCreate.hServerObj = hServerObj;
+    charCreate.bIsPlayer = true;
+    charCreate.bUseDefaultHitboxDims = true;
+    charCreate.nTimeScaleNumerator = 1;
+    charCreate.nTimeScaleDenominator = 1;
+
+    charCreate.hModel = g_pModelsDB ? g_pModelsDB->GetModelByRecordName(DEFAULT_PLAYERNAME) : NULL;
+
+    printf("FEARPORT: local character modelsdb=%p model=%p\n", (void *)g_pModelsDB, (void *)charCreate.hModel);
+    fflush(stdout);
+
+    if (!pSFXMgr->CreateSFX(SFX_CHARACTER_ID, &charCreate))
+    {
+        printf("FEARPORT: local character fx creation failed\n");
+        fflush(stdout);
+        return 0;
+    }
+
+    printf("FEARPORT: local character fx created for %p\n", hObject);
+    fflush(stdout);
+    g_hLocalCharacter = hServerObj;
+    return 1;
+}
+
 extern "C" __declspec(dllexport) void FearClient_RenderPortCamera()
 {
     if (!g_pPlayerMgr || !g_pLTClient)
@@ -108,8 +156,32 @@ extern "C" __declspec(dllexport) void FearClient_RenderPortCamera()
     static int s_nPortFrame = 0;
     ++s_nPortFrame;
     const char *pszCapturePath = getenv("FEAR_CAPTURE_PATH");
-    if (pszCapturePath && pszCapturePath[0] && s_nPortFrame == 5)
-        pRenderer->MakeScreenShot(pszCapturePath);
+    if (pszCapturePath && pszCapturePath[0])
+    {
+        static int s_nCaptureFrame = -1;
+        if (s_nCaptureFrame < 0)
+        {
+            const char *pszFrame = getenv("FEAR_CAPTURE_FRAME");
+            s_nCaptureFrame = pszFrame && pszFrame[0] ? atoi(pszFrame) : 5;
+        }
+
+        const char *pszEvery = getenv("FEAR_CAPTURE_EVERY");
+        const int nEvery = pszEvery && pszEvery[0] ? atoi(pszEvery) : 0;
+        if (nEvery > 0)
+        {
+            if (s_nPortFrame >= s_nCaptureFrame && ((s_nPortFrame - s_nCaptureFrame) % nEvery) == 0)
+            {
+                char szSeq[512];
+                _snprintf(szSeq, sizeof(szSeq), "%s_%04d.bmp", pszCapturePath, s_nPortFrame);
+                szSeq[sizeof(szSeq) - 1] = 0;
+                pRenderer->MakeScreenShot(szSeq);
+            }
+        }
+        else if (s_nPortFrame == s_nCaptureFrame)
+        {
+            pRenderer->MakeScreenShot(pszCapturePath);
+        }
+    }
 
     pRenderer->End3D();
     pRenderer->FlipScreen();
@@ -124,6 +196,47 @@ extern "C" __declspec(dllexport) void FearClient_LogState()
     const char *pszWorld = g_pMissionMgr ? g_pMissionMgr->GetCurrentWorldName() : "";
     printf("FEARPORT: clientstate game=%d recv=%d sent=%d player=%d world='%s'\n",
         nGameState, nRecvState, nSentState, nPlayerState, pszWorld ? pszWorld : "");
+
+    if (g_pLTClient)
+    {
+        uint32 nRealTime = g_pGameClientShell ? g_pGameClientShell->GetServerRealTimeMS() : 0;
+        int nInWorld = (g_pPlayerMgr && g_pPlayerMgr->GetMoveMgr() && g_pPlayerMgr->GetMoveMgr()->IsInWorld()) ? 1 : 0;
+        int nMoveAllowed = (g_pPlayerMgr && g_pPlayerMgr->IsPlayerMovementAllowed()) ? 1 : 0;
+        int nCamMode = (g_pPlayerMgr && g_pPlayerMgr->GetPlayerCamera()) ? (int)g_pPlayerMgr->GetPlayerCamera()->GetCameraMode() : -1;
+        printf("FEARPORT: timing sec=%.3f real=%u inworld=%d moveallowed=%d cammode=%d\n",
+            (double)g_pLTClient->GetTime(), nRealTime, nInWorld, nMoveAllowed, nCamMode);
+    }
+
+    if (g_pLTClient)
+    {
+        HOBJECT hCamera = NULL;
+        if (g_pPlayerMgr && g_pPlayerMgr->GetPlayerCamera())
+            hCamera = g_pPlayerMgr->GetPlayerCamera()->GetCamera();
+
+        LTVector vCamPos(0.0f, 0.0f, 0.0f);
+        LTRotation rCamRot;
+        if (hCamera)
+            g_pLTClient->GetObjectPos(hCamera, &vCamPos);
+        if (hCamera)
+            g_pLTClient->GetObjectRotation(hCamera, &rCamRot);
+
+        uint32 nObjects = 0;
+        HOBJECT hClientObj = g_hLocalCharacter;
+        LTVector vPlayerPos(0.0f, 0.0f, 0.0f);
+        if (hClientObj)
+        {
+            g_pLTClient->GetObjectPos(hClientObj, &vPlayerPos);
+            ++nObjects;
+        }
+
+        LTVector vCamFwd = hCamera ? rCamRot.Forward() : LTVector(0.0f, 0.0f, 1.0f);
+        printf("FEARPORT: cam obj=%p pos=%.2f %.2f %.2f fwd=%.3f %.3f %.3f char=%p cpos=%.2f %.2f %.2f\n",
+            (void *)hCamera, vCamPos.x, vCamPos.y, vCamPos.z,
+            vCamFwd.x, vCamFwd.y, vCamFwd.z,
+            (void *)hClientObj, vPlayerPos.x, vPlayerPos.y, vPlayerPos.z);
+        (void)nObjects;
+    }
+
     fflush(stdout);
 }
 
@@ -173,3 +286,138 @@ extern "C" __declspec(dllexport) void FearClient_MouseWheel(int x, int y, int nD
     if (g_pInterfaceMgr)
         g_pInterfaceMgr->OnMouseWheel(x, y, nDelta);
 }
+
+// Device/object indices of the port's ILTInput implementation (see
+// FEAR/Compat/v5host/fear_input_stub.cpp). The retail profile database is not
+// available on disk in this port, so the default command bindings are built here.
+static const uint32 kPortDeviceKeyboard = 0;
+static const uint32 kPortDeviceMouse = 1;
+static const uint32 kPortMouseAxisX = 0;
+static const uint32 kPortMouseAxisY = 1;
+static const uint32 kPortMouseButton0 = 2;
+static const uint32 kPortMouseButton1 = 3;
+
+int g_nFearMoveUpd = 0;
+int g_nFearMoveUpdBail = 0;
+int g_nFearControlFlags = 0;
+int g_nFearNormalMotion = 0;
+int g_nFearVelocityUpd = 0;
+int g_nFearShellPlaying = 0;
+int g_nFearPlayingEnter = 0;
+int g_nFearPlayingPaused = 0;
+int g_nFearShellUpd = 0;
+int g_nFearShellIface = 0;
+
+static void PortBindButton(uint32 nCommand, uint32 nDevice, uint32 nObject){
+    CBindMgr::SBinding sBinding;
+    sBinding.m_nCommand = nCommand;
+    sBinding.m_nDevice = nDevice;
+    sBinding.m_nObject = nObject;
+    CBindMgr::GetSingleton().SetBinding(sBinding);
+}
+
+extern "C" __declspec(dllexport) int FearClient_InstallDefaultBindings()
+{
+    CBindMgr::TBindingList aForward;
+    CBindMgr::GetSingleton().GetCommandBindings(COMMAND_ID_FORWARD, &aForward);
+
+    CBindMgr::TBindingList aYaw;
+    CBindMgr::GetSingleton().GetCommandBindings(COMMAND_ID_YAW, &aYaw);
+
+    printf("FEARPORT: existing bindings forward=%u yaw=%u\n",
+        (unsigned)aForward.size(), (unsigned)aYaw.size());
+    fflush(stdout);
+
+    PortBindButton(COMMAND_ID_FORWARD, kPortDeviceKeyboard, 'W');
+    PortBindButton(COMMAND_ID_REVERSE, kPortDeviceKeyboard, 'S');
+    PortBindButton(COMMAND_ID_STRAFE_LEFT, kPortDeviceKeyboard, 'A');
+    PortBindButton(COMMAND_ID_STRAFE_RIGHT, kPortDeviceKeyboard, 'D');
+    PortBindButton(COMMAND_ID_JUMP, kPortDeviceKeyboard, VK_SPACE);
+    PortBindButton(COMMAND_ID_DUCK, kPortDeviceKeyboard, VK_LCONTROL);
+    PortBindButton(COMMAND_ID_RUN, kPortDeviceKeyboard, VK_LSHIFT);
+    PortBindButton(COMMAND_ID_STAND, kPortDeviceKeyboard, VK_LSHIFT);
+    PortBindButton(COMMAND_ID_FIRING, kPortDeviceMouse, kPortMouseButton0);
+    PortBindButton(COMMAND_ID_ALT_FIRING, kPortDeviceMouse, kPortMouseButton1);
+    PortBindButton(COMMAND_ID_ACTIVATE, kPortDeviceKeyboard, 'E');
+    PortBindButton(COMMAND_ID_RELOAD, kPortDeviceKeyboard, 'R');
+    PortBindButton(COMMAND_ID_FLASHLIGHT, kPortDeviceKeyboard, 'F');
+    PortBindButton(COMMAND_ID_TOOLS, kPortDeviceKeyboard, 'L');
+    PortBindButton(COMMAND_ID_FOCUS, kPortDeviceKeyboard, 'Z');
+    PortBindButton(COMMAND_ID_TOGGLEMELEE, kPortDeviceKeyboard, 'V');
+    PortBindButton(COMMAND_ID_THROW_GRENADE, kPortDeviceKeyboard, 'G');
+    PortBindButton(COMMAND_ID_MENU, kPortDeviceKeyboard, VK_ESCAPE);
+
+    // Mouse axes: map the [0..1] device range onto [-1..1], matching ApplyMouse().
+    CBindMgr::SBinding sAxis;
+    sAxis.m_fDefaultValue = 0.0f;
+    sAxis.m_fOffset = -1.0f;
+    sAxis.m_fScale = 2.0f;
+    sAxis.m_nDevice = kPortDeviceMouse;
+    sAxis.m_nObject = kPortMouseAxisX;
+    sAxis.m_nCommand = COMMAND_ID_YAW;
+    CBindMgr::GetSingleton().SetBinding(sAxis);
+    sAxis.m_nObject = kPortMouseAxisY;
+    sAxis.m_nCommand = COMMAND_ID_PITCH;
+    CBindMgr::GetSingleton().SetBinding(sAxis);
+
+    return 1;
+}
+
+
+
+extern "C" __declspec(dllexport) void FearClient_LogInputState()
+{
+    CBindMgr &cBindMgr = CBindMgr::GetSingleton();
+    CBindMgr::TBindingList aForward;
+    cBindMgr.GetCommandBindings(COMMAND_ID_FORWARD, &aForward);
+
+    printf("FEARPORT: input bindings=%u forward=%d yaw=%.3f pitch=%.3f wdown=%d\n",
+        (unsigned)aForward.size(),
+        cBindMgr.IsCommandOn(COMMAND_ID_FORWARD) ? 1 : 0,
+        cBindMgr.GetExtremalCommandValue(COMMAND_ID_YAW),
+        cBindMgr.GetExtremalCommandValue(COMMAND_ID_PITCH),
+        (GetAsyncKeyState('W') & 0x8000) ? 1 : 0);
+
+    CMoveMgr *pMoveMgr = g_pPlayerMgr ? g_pPlayerMgr->GetMoveMgr() : NULL;
+    if (pMoveMgr)
+    {
+        LTVector vVel = pMoveMgr->GetVelocity();
+        HOBJECT hMoveObj = pMoveMgr->GetObject();
+        LTVector vPos(0.0f, 0.0f, 0.0f);
+        if (hMoveObj && g_pLTClient)
+            g_pLTClient->GetObjectPos(hMoveObj, &vPos);
+        printf("FEARPORT: movemgr obj=%p inworld=%d onground=%d vel=%.2f %.2f %.2f pos=%.2f %.2f %.2f allowed=%d dead=%d\n",
+            hMoveObj,
+            pMoveMgr->IsInWorld() ? 1 : 0,
+            pMoveMgr->IsOnGround() ? 1 : 0,
+            vVel.x, vVel.y, vVel.z,
+            vPos.x, vPos.y, vPos.z,
+            g_pPlayerMgr->IsPlayerMovementAllowed() ? 1 : 0,
+            g_pPlayerMgr->IsPlayerDead() ? 1 : 0);
+    }
+    else
+    {
+        printf("FEARPORT: movemgr null playermgr=%d\n", g_pPlayerMgr ? 1 : 0);
+    }
+
+    printf("FEARPORT: movepipe update=%d bail=%d flags=%d normal=%d vel=%d playing=%d pent=%d ppause=%d shellupd=%d iface=%d clientobj=%p paused=%d\n",
+        g_nFearMoveUpd, g_nFearMoveUpdBail, g_nFearControlFlags, g_nFearNormalMotion, g_nFearVelocityUpd,
+        g_nFearShellPlaying, g_nFearPlayingEnter, g_nFearPlayingPaused,
+        g_nFearShellUpd, g_nFearShellIface,
+        g_pLTClient ? g_pLTClient->GetClientObject() : NULL,
+        (g_pGameClientShell && g_pGameClientShell->IsServerPaused()) ? 1 : 0);
+
+    if (g_pPlayerMgr)
+    {
+        printf("FEARPORT: playerstate=%d inworld=%d gs=%d\n",
+            (int)g_pPlayerMgr->GetPlayerState(),
+            g_pPlayerMgr->IsPlayerInWorld() ? 1 : 0,
+            g_pInterfaceMgr ? (int)g_pInterfaceMgr->GetGameState() : -1);
+    }
+    fflush(stdout);
+}
+
+
+
+
+
