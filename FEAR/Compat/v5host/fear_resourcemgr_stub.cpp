@@ -36,8 +36,8 @@ LTRESULT CFearResourceMgr::CreateDualBlockAllocator(uint32 nPoolSize, bool bCont
 
 LTRESULT CFearResourceMgr::GetNumStreamingRegions(uint32& nNumRegions)
 {
-    printf("STUB ILTResourceMgr::GetNumStreamingRegions\n");
-    return SvcDefault<LTRESULT>::Get();
+    nNumRegions = 0;
+    return LT_OK;
 }
 
 HSTREAMINGREGION CFearResourceMgr::GetStreamingRegion(uint32 nIndex)
@@ -48,44 +48,45 @@ HSTREAMINGREGION CFearResourceMgr::GetStreamingRegion(uint32 nIndex)
 
 LTRESULT CFearResourceMgr::GetPointStreamingRegions(const LTVector& vPos, HSTREAMINGREGION& hRegion, HSTREAMINGREGION& hLinked)
 {
-    printf("STUB ILTResourceMgr::GetPointStreamingRegions\n");
-    return SvcDefault<LTRESULT>::Get();
+    hRegion = NULL;
+    hLinked = NULL;
+    return LT_OK;
 }
 
 LTRESULT CFearResourceMgr::GetStreamingRegionPoolSize(uint32& nPoolSize)
 {
-    printf("STUB ILTResourceMgr::GetStreamingRegionPoolSize\n");
-    return SvcDefault<LTRESULT>::Get();
+    nPoolSize = 0;
+    return LT_OK;
 }
 
 LTRESULT CFearResourceMgr::GetGlobalPoolSize(uint32& nPoolSize)
 {
-    printf("STUB ILTResourceMgr::GetGlobalPoolSize\n");
-    return SvcDefault<LTRESULT>::Get();
+    nPoolSize = 0;
+    return LT_OK;
 }
 
 HREGIONASSETLIST CFearResourceMgr::GetGlobalAssetList()
 {
-    printf("STUB ILTResourceMgr::GetGlobalAssetList\n");
-    return SvcDefault<HREGIONASSETLIST>::Get();
+    return NULL;
 }
 
 LTRESULT CFearResourceMgr::GetStreamingRegionResourceLimit(HSTREAMINGREGION hRegion, uint32& nLimit)
 {
-    printf("STUB ILTResourceMgr::GetStreamingRegionResourceLimit\n");
-    return SvcDefault<LTRESULT>::Get();
+    nLimit = 0;
+    return LT_OK;
 }
 
 HREGIONASSETLIST CFearResourceMgr::GetStreamingRegionAssetList(HSTREAMINGREGION hRegion)
 {
-    printf("STUB ILTResourceMgr::GetStreamingRegionAssetList\n");
-    return SvcDefault<HREGIONASSETLIST>::Get();
+    return NULL;
 }
 
 LTRESULT CFearResourceMgr::GetStreamingRegionName(HSTREAMINGREGION hRegion, char* pszBuffer, uint32 nBufferLen)
 {
-    printf("STUB ILTResourceMgr::GetStreamingRegionName\n");
-    return SvcDefault<LTRESULT>::Get();
+    if (!pszBuffer || !nBufferLen)
+        return LT_INVALIDPARAMS;
+    pszBuffer[0] = '\0';
+    return LT_OK;
 }
 
 LTRESULT CFearResourceMgr::SetActiveRegion(HSTREAMINGREGION hRegion)
@@ -108,8 +109,10 @@ LTRESULT CFearResourceMgr::DiscardRegionAssetList(HREGIONASSETLIST hList)
 
 LTRESULT CFearResourceMgr::GetRegionAssetListStats(HREGIONASSETLIST hList, uint32& nNumLoaded, uint32& nTotalAssets, uint32& nMemUsage)
 {
-    printf("STUB ILTResourceMgr::GetRegionAssetListStats\n");
-    return SvcDefault<LTRESULT>::Get();
+    nNumLoaded = 0;
+    nTotalAssets = 0;
+    nMemUsage = 0;
+    return LT_OK;
 }
 
 LTRESULT CFearResourceMgr::SetPrefetchAllocator(ILTResourceAllocator* pAllocator)

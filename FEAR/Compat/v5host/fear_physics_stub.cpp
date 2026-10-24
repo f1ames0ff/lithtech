@@ -1,5 +1,6 @@
 #include "fear_physics_stub.h"
 #include "fear_object_map.h"
+#include "fear_host_api.h"
 #include <stdio.h>
 
 template <typename T> struct SvcDefault { static T Get() { return T(); } };
@@ -64,16 +65,25 @@ LTRESULT CFearPhysics::UpdateMovement(MoveInfo *pInfo)
     if (!pState)
         return LT_OK;
 
-    float fDt = pInfo->m_dt;
-    if (fDt < 0.0f)
-        fDt = 0.0f;
+    float fDt = FearHost_GetFrameDelta();
+    if (fDt < (1.0f / 1000.0f))
+        fDt = 1.0f / 1000.0f;
     if (fDt > 0.1f)
         fDt = 0.1f;
+    pInfo->m_dt = fDt;
 
     if (!_finite(pState->m_vAcceleration.x) || !_finite(pState->m_vAcceleration.y) || !_finite(pState->m_vAcceleration.z))
         pState->m_vAcceleration.Init();
     if (!_finite(pState->m_vVelocity.x) || !_finite(pState->m_vVelocity.y) || !_finite(pState->m_vVelocity.z))
         pState->m_vVelocity.Init();
+
+    if (pState->m_bOnGround)
+    {
+        if (pState->m_vAcceleration.y < 0.0f)
+            pState->m_vAcceleration.y = 0.0f;
+        if (pState->m_vVelocity.y < 0.0f)
+            pState->m_vVelocity.y = 0.0f;
+    }
 
     pState->m_vVelocity += pState->m_vAcceleration * fDt;
     pState->m_vAcceleration.Init();
@@ -111,8 +121,7 @@ LTRESULT CFearPhysics::RotatePushObjects(HOBJECT hToMove, const LTRotation& q, H
 
 LTRESULT CFearPhysics::IsWorldObject(HOBJECT hObj)
 {
-    printf("STUB ILTPhysics::IsWorldObject\n");
-    return SvcDefault<LTRESULT>::Get();
+    return LT_NO;
 }
 
 LTRESULT CFearPhysics::GetStairHeight(float &fHeight)
@@ -258,6 +267,71 @@ LTRESULT CFearPhysics::MoveObject(HOBJECT hObj, const LTVector& p, uint32 flag)
         return LT_INVALIDPARAMS;
     }
 
+    FearObjectPhysics *pState = FearFindObjectPhysics(hObj);
+    static int s_nMoveCalls = 0;
+    static int s_nMoveHits = 0;
+    ++s_nMoveCalls;
+    if (s_nMoveCalls <= 3 || (s_nMoveCalls % 60) == 0)
+    {
+        printf("FEARPHYS: move calls=%d hits=%d\n", s_nMoveCalls, s_nMoveHits);
+        fflush(stdout);
+    }
+    const FearEngineApi *pApi = FearHost_GetEngineApi();
+    const bool bTeleport = (flag & MOVEOBJECT_TELEPORT) != 0;
+    if (bTeleport && s_nMoveCalls <= 3)
+    {
+        printf("FEARPHYS: teleport obj=%p dst=%.1f %.1f %.1f\n",
+            (void *)hObj, vPosition[0], vPosition[1], vPosition[2]);
+        fflush(stdout);
+    }
+    if (pApi && pApi->IntersectWorld && !bTeleport)
+    {
+        float vCurrent[3] = { 0.0f, 0.0f, 0.0f };
+        float vRotation[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+        bool bHaveTransform = FearClient_GetObjectTransform(hObj, vCurrent, vRotation);
+        if (s_nMoveCalls <= 3)
+        {
+            printf("FEARPHYS: call=%d obj=%p have=%d cur=%.1f %.1f %.1f dst=%.1f %.1f %.1f\n",
+                s_nMoveCalls, (void *)hObj, bHaveTransform ? 1 : 0,
+                vCurrent[0], vCurrent[1], vCurrent[2], vPosition[0], vPosition[1], vPosition[2]);
+            fflush(stdout);
+        }
+        if (bHaveTransform)
+        {
+            float vHit[3] = { 0.0f, 0.0f, 0.0f };
+            float vNormal[3] = { 0.0f, 1.0f, 0.0f };
+            float fDist = 0.0f;
+            if (pApi->IntersectWorld(vCurrent, vPosition, vHit, vNormal, &fDist))
+            {
+                ++s_nMoveHits;
+                if (s_nMoveHits <= 5 || (s_nMoveHits % 300) == 0)
+                {
+                    printf("FEARPHYS: clamp n=%d from=%.1f %.1f %.1f to=%.1f %.1f %.1f hit=%.1f %.1f %.1f\n",
+                        s_nMoveHits, vCurrent[0], vCurrent[1], vCurrent[2],
+                        vPosition[0], vPosition[1], vPosition[2], vHit[0], vHit[1], vHit[2]);
+                    fflush(stdout);
+                }
+                const float fEpsilon = 1.0f;
+                vPosition[0] = vHit[0] + vNormal[0] * fEpsilon;
+                vPosition[1] = vHit[1] + vNormal[1] * fEpsilon;
+                vPosition[2] = vHit[2] + vNormal[2] * fEpsilon;
+
+                if (pState)
+                {
+                    float fDot = pState->m_vVelocity.x * vNormal[0] +
+                                 pState->m_vVelocity.y * vNormal[1] +
+                                 pState->m_vVelocity.z * vNormal[2];
+                    if (fDot < 0.0f)
+                    {
+                        pState->m_vVelocity.x -= vNormal[0] * fDot;
+                        pState->m_vVelocity.y -= vNormal[1] * fDot;
+                        pState->m_vVelocity.z -= vNormal[2] * fDot;
+                    }
+                }
+            }
+        }
+    }
+
     if (!FearClient_SetObjectPosition(hObj, vPosition))
         return LT_NOTFOUND;
 
@@ -275,6 +349,28 @@ LTRESULT CFearPhysics::GetStandingOn(HOBJECT hObj, CollisionInfo *info)
     info->m_hPoly = INVALID_HPOLY;
     info->m_Plane.m_Normal.Init(0.0f, 1.0f, 0.0f);
     info->m_Plane.m_Dist = 0.0f;
+
+    const FearEngineApi *pApi = FearHost_GetEngineApi();
+    float vPos[3] = { 0.0f, 0.0f, 0.0f };
+    float vRot[4] = { 0.0f, 0.0f, 0.0f, 1.0f };
+    if (pApi && pApi->IntersectWorld && FearClient_GetObjectTransform(hObj, vPos, vRot))
+    {
+        float vFrom[3] = { vPos[0], vPos[1], vPos[2] };
+        float vTo[3] = { vPos[0], vPos[1] - 64.0f, vPos[2] };
+        float vHit[3] = { 0.0f, 0.0f, 0.0f };
+        float vNormal[3] = { 0.0f, 1.0f, 0.0f };
+        float fDist = 0.0f;
+        if (pApi->IntersectWorld(vFrom, vTo, vHit, vNormal, &fDist))
+        {
+            info->m_Plane.m_Normal.Init(vNormal[0], vNormal[1], vNormal[2]);
+            info->m_Plane.m_Dist = -(vNormal[0] * vHit[0] + vNormal[1] * vHit[1] + vNormal[2] * vHit[2]);
+            pState->m_bOnGround = (vNormal[1] > 0.5f) ? true : false;
+        }
+        else
+        {
+            pState->m_bOnGround = info->m_hObject != NULL;
+        }
+    }
 
     return LT_OK;
 }

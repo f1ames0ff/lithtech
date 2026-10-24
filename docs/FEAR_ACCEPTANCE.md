@@ -178,3 +178,38 @@ Each gate records:
   drawn; fog is disabled in the world (`FogEnable=0`); `LightCube` lights are
   evaluated as omnidirectional point lights rather than projected cube maps;
   reflections, shadow volumes and `.fxo` post effects are absent.
+
+## Iteration 24 animation evidence
+
+- The `MODL` version 33 record layout is now confirmed against the decrypted retail
+  `FEAR.exe` and the retail `EngineServer.dll` loader. The record starts four bytes before
+  the reported `dims`, and the animation-data blob begins at
+  `first_record_offset - allocation[0x58]`.
+- `CFearModel` now delegates animation names, indices, durations, keyframe counts, user
+  dimensions, sampled node transforms, current node transforms, socket lookup and socket
+  transforms to the native Public Tools server `ILTModel`.
+- The local player-body model is mapped to the authoritative server player. Other mapped
+  objects use their 15-bit wire ID, and unresolved client-only objects safely remain on the
+  local fallback.
+- Verified live values include `LSt -> index 2, length 33 ms` and
+  `LSt_Unarmed -> index 10, length 333 ms`. The former synthetic `1000 ms` duration is no
+  longer used for these clips.
+- A rebuilt first-mission run remained responsive with no assertion, runtime-check,
+  pure-virtual, dialogue-timeout or outside-of-world event during the post-fix soak.
+- Remaining animation work is tracker-transition parity, skeletal mesh submission, view
+  model visibility and frame-by-frame visual comparison against retail.
+
+## Iteration 25 weapon-fire gate
+
+- `CF_NOTIFYMODELKEYS` reaches the real v4 client object, and native server keyframe
+  strings are delivered through the source `ConParse` semantics.
+- `CFearModel::SetCurAnim` starts playback, while `ResetAnim` resets time without
+  clearing the playing flag.
+- The pistol reaches `W_FIRING`; native clip 261 queues `FIRE_KEY; sound_key 10` at
+  time zero and `MID_WEAPON_FIRE` reaches the server.
+- Accepted live values: first shot `18/100 -> 17/99`, second shot `16/98`, reload
+  restores `18/98`.
+- First-person movement remains synchronized with the server and advances in the authored
+  level.
+- Remaining gates: animated player/view-model rendering, NPC and cutscene animation,
+  HUD parity, retail scene comparison and the 95% visual-parity target.

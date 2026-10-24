@@ -213,6 +213,16 @@ static LTRESULT ModelExtraInit(	LTObject			*pObject,
 	{
 		// try and load the model.
 		dResult = g_pClientMgr->LoadModel( pSetup->m_Filename[0], pModel );
+		static int s_nExtraInitLoadLogs = 0;
+		if (s_nExtraInitLoadLogs < 64)
+		{
+			++s_nExtraInitLoadLogs;
+			printf("FEARMODEL: ModelExtraInit file='%s' result=%d\n",
+				pSetup->m_Filename[0].m_pFilename ?
+					pSetup->m_Filename[0].m_pFilename : "",
+				(int)dResult);
+			fflush(stdout);
+		}
 		
 		if( dResult == LT_OK )
 		{
@@ -228,6 +238,9 @@ static LTRESULT ModelExtraInit(	LTObject			*pObject,
 		{
 			// well heck we got ourselves an invalid model here !
 			dResult = g_pClientMgr->LoadModel("models\\default.ltb", pModel );
+			printf("FEARMODEL: ModelExtraInit fallback default.ltb result=%d\n",
+				(int)dResult);
+			fflush(stdout);
 			if( dResult == LT_OK )
 			{
 				pModelInstance->BindModelDB(pModel);

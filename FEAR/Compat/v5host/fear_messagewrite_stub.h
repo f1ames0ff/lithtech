@@ -11,10 +11,10 @@ public:
     declare_interface(CFearMessageWrite)
     CFearMessageWrite() : m_nBitPos(0) {}
     ~CFearMessageWrite() {}
-    void AddRef() override {}
-    void Release() override {}
-    void StaticRelease() override {}
-    void Free() override {}
+    void AddRef() override;
+    void Release() override;
+    void StaticRelease() override;
+    void Free() override;
 
     void Reset() override;
     ILTMessage_Read * Read() override;
@@ -40,8 +40,9 @@ private:
 
     std::vector<uint8> m_Data;
     uint32 m_nBitPos;
+    int m_nRefs = 0;
 };
 
-extern CFearMessageWrite g_FearMessageWrite;
+
 
 #endif

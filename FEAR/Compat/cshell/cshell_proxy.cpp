@@ -1,5 +1,8 @@
 #include <windows.h>
 #include <dbghelp.h>
+#include <d3d9.h>
+#include <dxgi.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include "fear_host_api.h"
@@ -7,10 +10,13 @@
 #include "ltmodule.h"
 #include "iclientshell.h"
 #include "iltclient.h"
+#include "iltcommon.h"
+#include "iltmodel.h"
 #include "client_filemgr.h"
 #include "cshell_filemgr.h"
 #include "cshell_object.h"
 #include "cshell_render.h"
+#include "fear_world.h"
 
 static HINSTANCE g_hThisModule = NULL;
 static HMODULE g_hFearHost = NULL;
@@ -20,18 +26,56 @@ static int (*g_pfnFearHostOnEngineInitialized)(const FearMode*, const unsigned c
 static void (*g_pfnFearHostUpdate)(void) = NULL;
 static void (*g_pfnFearHostOnKeyDown)(int, int) = NULL;
 static void (*g_pfnFearHostOnKeyUp)(int) = NULL;
+static void (*g_pfnFearHostOnEvent)(uint32, uint32) = NULL;
 static void (*g_pfnFearHostOnMouseMove)(int, int) = NULL;
 static void (*g_pfnFearHostOnMouseButton)(int, int, int, int) = NULL;
+static void (*g_pfnFearHostOnModelKey)(void *, uint32, void *) = NULL;
 static void (*g_pfnFearHostOnEngineTerm)(void) = NULL;
 
 static int g_nFearMouseX = 320;
 static int g_nFearMouseY = 240;
 static bool g_bFearMouseInitialized = false;
 
+static int FearSdlKeyToVk(SDL_Keycode sym)
+{
+    if (sym >= SDLK_a && sym <= SDLK_z)
+        return (int)(sym - SDLK_a) + 'A';
+    if (sym >= SDLK_0 && sym <= SDLK_9)
+        return (int)sym;
+    switch (sym)
+    {
+    case SDLK_ESCAPE: return VK_ESCAPE;
+    case SDLK_SPACE: return VK_SPACE;
+    case SDLK_RETURN: return VK_RETURN;
+    case SDLK_TAB: return VK_TAB;
+    case SDLK_BACKSPACE: return VK_BACK;
+    case SDLK_LSHIFT: return VK_LSHIFT;
+    case SDLK_RSHIFT: return VK_RSHIFT;
+    case SDLK_LCTRL: return VK_LCONTROL;
+    case SDLK_RCTRL: return VK_RCONTROL;
+    case SDLK_LALT: return VK_LMENU;
+    case SDLK_UP: return VK_UP;
+    case SDLK_DOWN: return VK_DOWN;
+    case SDLK_LEFT: return VK_LEFT;
+    case SDLK_RIGHT: return VK_RIGHT;
+    case SDLK_DELETE: return VK_DELETE;
+    case SDLK_HOME: return VK_HOME;
+    case SDLK_END: return VK_END;
+    default: break;
+    }
+    if (sym > 0 && sym < 128)
+        return (int)sym;
+    return 0;
+}
+
 ILTClient *g_pLTClientV4 = NULL;
 define_holder(ILTClient, g_pLTClientV4);
 IClientFileMgr *g_pClientFileMgr = NULL;
 define_holder(IClientFileMgr, g_pClientFileMgr);
+static ILTCommon *g_pCommonClientV4 = NULL;
+define_holder_to_instance(ILTCommon, g_pCommonClientV4, Client);
+static ILTModel *g_pModelClientV4 = NULL;
+define_holder_to_instance(ILTModel, g_pModelClientV4, Client);
 
 static PVOID g_hFearCrashHandler = NULL;
 static volatile LONG g_nFearCrashActive = 0;
@@ -243,6 +287,30 @@ static void FearPrintCallStack(EXCEPTION_POINTERS *pExceptionInfo)
     }
 }
 
+static void __cdecl FearAbortHandler(int)
+{
+    static volatile LONG s_bAbortActive = 0;
+    if (InterlockedCompareExchange(&s_bAbortActive, 1, 0) != 0)
+        return;
+
+    void *frames[32] = {0};
+    USHORT nFrames = CaptureStackBackTrace(0, 32, frames, NULL);
+    printf("FEARABORT: SIGABRT frames=%u\n", (unsigned)nFrames);
+    for (USHORT i = 0; i < nFrames; ++i)
+    {
+        ULONG_PTR nPC = reinterpret_cast<ULONG_PTR>(frames[i]);
+        char szModule[MAX_PATH] = {0};
+        FearGetModuleName(nPC, szModule, sizeof(szModule));
+        HMODULE hModule = szModule[0] ? GetModuleHandleA(szModule) : NULL;
+        ULONG_PTR nRva = hModule ? nPC - reinterpret_cast<ULONG_PTR>(hModule) : 0;
+        printf("ABORT %02u pc=%p module=%s base=%p rva=%p\n",
+               (unsigned)i, reinterpret_cast<void *>(nPC), szModule,
+               reinterpret_cast<void *>(hModule), reinterpret_cast<void *>(nRva));
+    }
+    fflush(stdout);
+    signal(SIGABRT, SIG_DFL);
+}
+
 static LONG CALLBACK FearCrashHandler(EXCEPTION_POINTERS *pExceptionInfo)
 {
     if (!pExceptionInfo || !pExceptionInfo->ExceptionRecord || !pExceptionInfo->ContextRecord)
@@ -338,6 +406,7 @@ static int EngineSetRenderMode(const FearMode *pMode)
     mode.m_BitDepth = pMode->m_BitDepth;
     mode.m_bHWTnL = (pMode->m_bHWTnL != 0);
     strncpy(mode.m_InternalName, pMode->m_DeviceName, sizeof(mode.m_InternalName) - 1);
+    FearWorld_Shutdown();
     return (g_pLTClientV4->SetRenderMode(&mode, NULL) == LT_OK) ? 1 : 0;
 }
 
@@ -373,6 +442,296 @@ static void *EngineGetEngineHook(const char *pszName)
     return pValue;
 }
 
+static int EngineSetObjectFlags(void *hObject, uint32_t nFlagType, uint32_t nFlags, uint32_t nMask)
+{
+    if (!hObject || !g_pCommonClientV4 || nFlagType > OFT_Client)
+        return 0;
+    return g_pCommonClientV4->SetObjectFlags(
+        (HOBJECT)hObject, (ObjFlagType)nFlagType, nFlags, nMask) == LT_OK;
+}
+
+static int EngineGetObjectFlags(void *hObject, uint32_t nFlagType, uint32_t *pFlags)
+{
+    if (!hObject || !pFlags || !g_pCommonClientV4 || nFlagType > OFT_Client)
+        return 0;
+    return g_pCommonClientV4->GetObjectFlags(
+        (HOBJECT)hObject, (ObjFlagType)nFlagType, *pFlags) == LT_OK;
+}
+
+static bool EngineModelObjectIsValid(void *hObject, const char *pszOperation)
+{
+    if (!hObject || !g_pCommonClientV4)
+        return false;
+
+    uint32 nObjectType = 0;
+    LTRESULT nResult = g_pCommonClientV4->GetObjectType(
+        (HOBJECT)hObject, &nObjectType);
+    if (nResult != LT_OK || nObjectType != OT_MODEL)
+    {
+        static int s_nInvalidModelLogs = 0;
+        if (s_nInvalidModelLogs < 32)
+        {
+            ++s_nInvalidModelLogs;
+            printf("FEARMODEL: engine %s rejected obj=%p type=%u result=%d\n",
+                pszOperation, hObject, (unsigned)nObjectType, (int)nResult);
+            fflush(stdout);
+        }
+        return false;
+    }
+    return true;
+}
+
+static int EngineModelSetCurAnim(
+    void *hObject, uint32_t nTracker, uint32_t nAnim, int bInterpolate)
+{
+    if (!EngineModelObjectIsValid(hObject, "SetCurAnim") || !g_pModelClientV4)
+        return 0;
+    return g_pModelClientV4->SetCurAnim(
+        (HOBJECT)hObject, (ANIMTRACKERID)nTracker, (HMODELANIM)nAnim) == LT_OK;
+}
+
+static int EngineModelSetPlaying(void *hObject, uint32_t nTracker, int bPlaying)
+{
+    if (!EngineModelObjectIsValid(hObject, "SetPlaying") || !g_pModelClientV4)
+        return 0;
+    return g_pModelClientV4->SetPlaying(
+        (HOBJECT)hObject, (ANIMTRACKERID)nTracker, bPlaying != 0) == LT_OK;
+}
+
+static int EngineModelSetLooping(void *hObject, uint32_t nTracker, int bLooping)
+{
+    if (!EngineModelObjectIsValid(hObject, "SetLooping") || !g_pModelClientV4)
+        return 0;
+    return g_pModelClientV4->SetLooping(
+        (HOBJECT)hObject, (ANIMTRACKERID)nTracker, bLooping != 0) == LT_OK;
+}
+
+static int EngineModelSetCurAnimTime(void *hObject, uint32_t nTracker, uint32_t nTime)
+{
+    if (!EngineModelObjectIsValid(hObject, "SetCurAnimTime") || !g_pModelClientV4)
+        return 0;
+    return g_pModelClientV4->SetCurAnimTime(
+        (HOBJECT)hObject, (ANIMTRACKERID)nTracker, nTime) == LT_OK;
+}
+
+static int EngineModelResetAnim(void *hObject, uint32_t nTracker)
+{
+    if (!EngineModelObjectIsValid(hObject, "ResetAnim") || !g_pModelClientV4)
+        return 0;
+    return g_pModelClientV4->ResetAnim(
+        (HOBJECT)hObject, (ANIMTRACKERID)nTracker) == LT_OK;
+}
+
+static int EngineModelGetCurAnim(void *hObject, uint32_t nTracker, uint32_t *pAnim)
+{
+    if (!pAnim || !EngineModelObjectIsValid(hObject, "GetCurAnim") || !g_pModelClientV4)
+        return 0;
+    HMODELANIM nAnim = INVALID_MODEL_ANIM;
+    LTRESULT nResult = g_pModelClientV4->GetCurAnim(
+        (HOBJECT)hObject, (ANIMTRACKERID)nTracker, nAnim);
+    *pAnim = (uint32_t)nAnim;
+    return nResult == LT_OK;
+}
+
+static int EngineModelGetCurAnimLength(void *hObject, uint32_t nTracker, uint32_t *pLength)
+{
+    if (!pLength || !EngineModelObjectIsValid(hObject, "GetCurAnimLength") ||
+        !g_pModelClientV4)
+        return 0;
+    return g_pModelClientV4->GetCurAnimLength(
+        (HOBJECT)hObject, (ANIMTRACKERID)nTracker, *pLength) == LT_OK;
+}
+
+static int EngineModelGetCurAnimTime(void *hObject, uint32_t nTracker, uint32_t *pTime)
+{
+    if (!pTime || !EngineModelObjectIsValid(hObject, "GetCurAnimTime") ||
+        !g_pModelClientV4)
+        return 0;
+    return g_pModelClientV4->GetCurAnimTime(
+        (HOBJECT)hObject, (ANIMTRACKERID)nTracker, *pTime) == LT_OK;
+}
+
+static int EngineModelGetPlaying(void *hObject, uint32_t nTracker)
+{
+    if (!EngineModelObjectIsValid(hObject, "GetPlaying") || !g_pModelClientV4)
+        return 0;
+    return g_pModelClientV4->GetPlaying(
+        (HOBJECT)hObject, (ANIMTRACKERID)nTracker) == LT_YES;
+}
+
+static int EngineModelGetLooping(void *hObject, uint32_t nTracker)
+{
+    if (!EngineModelObjectIsValid(hObject, "GetLooping") || !g_pModelClientV4)
+        return 0;
+    return g_pModelClientV4->GetLooping(
+        (HOBJECT)hObject, (ANIMTRACKERID)nTracker) == LT_YES;
+}
+
+static int EngineModelSetAnimRate(void *hObject, uint32_t nTracker, float fRate)
+{
+    if (!EngineModelObjectIsValid(hObject, "SetAnimRate") || !g_pModelClientV4)
+        return 0;
+    return g_pModelClientV4->SetAnimRate(
+        (HOBJECT)hObject, (ANIMTRACKERID)nTracker, fRate) == LT_OK;
+}
+
+static int EngineModelGetAnimRate(void *hObject, uint32_t nTracker, float *pRate)
+{
+    if (!pRate || !EngineModelObjectIsValid(hObject, "GetAnimRate") ||
+        !g_pModelClientV4)
+        return 0;
+    return g_pModelClientV4->GetAnimRate(
+        (HOBJECT)hObject, (ANIMTRACKERID)nTracker, *pRate) == LT_OK;
+}
+
+static int EngineModelGetAnimIndex(void *hObject, const char *pszName, uint32_t *pAnim)
+{
+    if (!pszName || !pAnim || !EngineModelObjectIsValid(hObject, "GetAnimIndex") ||
+        !g_pModelClientV4)
+        return 0;
+    return g_pModelClientV4->GetAnimIndex(
+        (HOBJECT)hObject, pszName, *pAnim) == LT_OK;
+}
+
+static int EngineGetRenderModes(FearMode *pModes, int nMaxModes)
+{
+    if (!g_pLTClientV4)
+        return -1;
+
+    RMode *pHead = g_pLTClientV4->GetRenderModes();
+    int nCount = 0;
+    for (RMode *pMode = pHead; pMode; pMode = pMode->m_pNext)
+    {
+        if (pModes && nCount < nMaxModes)
+        {
+            FearMode &mode = pModes[nCount];
+            memset(&mode, 0, sizeof(mode));
+            mode.m_Width = pMode->m_Width;
+            mode.m_Height = pMode->m_Height;
+            mode.m_BitDepth = pMode->m_BitDepth;
+            mode.m_bHWTnL = pMode->m_bHWTnL ? 1 : 0;
+            strncpy(mode.m_DeviceName, pMode->m_InternalName, sizeof(mode.m_DeviceName) - 1);
+        }
+        ++nCount;
+    }
+
+    g_pLTClientV4->RelinquishRenderModes(pHead);
+    return nCount;
+}
+
+static int EngineQueryPerformanceStats(FearPerformanceStats *pStats, int bQuick)
+{
+    (void)bQuick;
+    if (!pStats)
+        return 0;
+
+    static FearPerformanceStats s_Stats;
+    static bool s_bStatsInitialized = false;
+    if (!s_bStatsInitialized)
+    {
+        s_bStatsInitialized = true;
+        memset(&s_Stats, 0, sizeof(s_Stats));
+
+        SYSTEM_INFO systemInfo;
+        GetSystemInfo(&systemInfo);
+        s_Stats.m_nCPUCount = systemInfo.dwNumberOfProcessors;
+
+        MEMORYSTATUSEX memoryStatus;
+        memset(&memoryStatus, 0, sizeof(memoryStatus));
+        memoryStatus.dwLength = sizeof(memoryStatus);
+        if (GlobalMemoryStatusEx(&memoryStatus))
+            s_Stats.m_nCPUMemory = (uint32_t)(memoryStatus.ullTotalPhys / (1024ull * 1024ull));
+
+        DWORD nMHz = 0;
+        DWORD nMHzSize = sizeof(nMHz);
+        if (RegGetValueA(HKEY_LOCAL_MACHINE,
+            "HARDWARE\\DESCRIPTION\\System\\CentralProcessor\\0", "~MHz",
+            RRF_RT_REG_DWORD, NULL, &nMHz, &nMHzSize) == ERROR_SUCCESS)
+            s_Stats.m_fCPUFrequency = (float)nMHz / 1000.0f;
+        if (s_Stats.m_fCPUFrequency <= 0.0f)
+            s_Stats.m_fCPUFrequency = 1.0f;
+
+        IDirect3D9 *pD3D = Direct3DCreate9(D3D_SDK_VERSION);
+        if (pD3D)
+        {
+            D3DCAPS9 caps;
+            memset(&caps, 0, sizeof(caps));
+            HRESULT nCapsResult = pD3D->GetDeviceCaps(D3DADAPTER_DEFAULT, D3DDEVTYPE_HAL, &caps);
+            if (SUCCEEDED(nCapsResult))
+            {
+                s_Stats.m_fGPUMaxPS = (float)((caps.PixelShaderVersion >> 8) & 0xFF) +
+                    (float)(caps.PixelShaderVersion & 0xFF) / 100.0f;
+                s_Stats.m_fGPUMaxVS = (float)((caps.VertexShaderVersion >> 8) & 0xFF) +
+                    (float)(caps.VertexShaderVersion & 0xFF) / 100.0f;
+            }
+            else
+            {
+                printf("FEARPERF: D3D9 GetDeviceCaps failed hr=0x%08lx\n", (unsigned long)nCapsResult);
+            }
+            pD3D->Release();
+        }
+
+        IDXGIFactory1 *pFactory = NULL;
+        if (SUCCEEDED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&pFactory)) && pFactory)
+        {
+            unsigned long long nBestMemory = 0;
+            for (UINT i = 0;; ++i)
+            {
+                IDXGIAdapter1 *pAdapter = NULL;
+                if (pFactory->EnumAdapters1(i, &pAdapter) == DXGI_ERROR_NOT_FOUND)
+                    break;
+                if (!pAdapter)
+                    continue;
+
+                DXGI_ADAPTER_DESC1 desc;
+                memset(&desc, 0, sizeof(desc));
+                if (SUCCEEDED(pAdapter->GetDesc1(&desc)))
+                {
+                    unsigned long long nMemory = desc.DedicatedVideoMemory;
+                    if (nMemory == 0)
+                        nMemory = desc.SharedSystemMemory;
+                    if (nMemory > nBestMemory)
+                        nBestMemory = nMemory;
+                }
+                pAdapter->Release();
+            }
+            pFactory->Release();
+            s_Stats.m_nGPUMemory = (uint32_t)(nBestMemory / (1024ull * 1024ull));
+        }
+
+        if (s_Stats.m_fGPUMaxPS <= 0.0f || s_Stats.m_fGPUMaxVS <= 0.0f)
+        {
+            s_Stats.m_fGPUMaxPS = 3.0f;
+            s_Stats.m_fGPUMaxVS = 3.0f;
+            printf("FEARPERF: D3D9 shader caps unavailable; using D3D9 feature baseline\n");
+        }
+
+        if (s_Stats.m_nGPUMemory == 0)
+            s_Stats.m_nGPUMemory = 1024;
+        if (s_Stats.m_nGPUMemory >= 4096)
+            s_Stats.m_fGPUPS11Fill = s_Stats.m_fGPUPS20Fill = 20000.0f;
+        else if (s_Stats.m_nGPUMemory >= 2048)
+            s_Stats.m_fGPUPS11Fill = s_Stats.m_fGPUPS20Fill = 10000.0f;
+        else if (s_Stats.m_nGPUMemory >= 1024)
+            s_Stats.m_fGPUPS11Fill = s_Stats.m_fGPUPS20Fill = 5000.0f;
+        else
+            s_Stats.m_fGPUPS11Fill = s_Stats.m_fGPUPS20Fill = 2000.0f;
+
+        printf("FEARPERF: detected cpu=%.2fGHz cpus=%u ram=%uMB ps=%.2f vs=%.2f gpu=%uMB\n",
+            s_Stats.m_fCPUFrequency, s_Stats.m_nCPUCount, s_Stats.m_nCPUMemory,
+            s_Stats.m_fGPUMaxPS, s_Stats.m_fGPUMaxVS, s_Stats.m_nGPUMemory);
+        fflush(stdout);
+    }
+
+    *pStats = s_Stats;
+    return 1;
+}
+
+static int EngineIntersectWorld(const float *pFrom, const float *pTo, float *pHit, float *pNormal, float *pDist)
+{
+    return FearWorld_IntersectSegment(pFrom, pTo, pHit, pNormal, pDist);
+}
+
 static const FearEngineApi g_EngineApi =
 {
     EngineSetRenderMode,
@@ -389,7 +748,26 @@ static const FearEngineApi g_EngineApi =
     FearFile_List,
     FearFile_FreeList,
     FearObject_Create,
-    &g_FearRenderApi
+    &g_FearRenderApi,
+    EngineIntersectWorld,
+    EngineGetRenderModes,
+    EngineQueryPerformanceStats,
+    EngineSetObjectFlags,
+    EngineGetObjectFlags,
+    EngineModelSetCurAnim,
+    EngineModelSetPlaying,
+    EngineModelSetLooping,
+    EngineModelSetCurAnimTime,
+    EngineModelResetAnim,
+    EngineModelGetCurAnim,
+    EngineModelGetCurAnimLength,
+    EngineModelGetCurAnimTime,
+    EngineModelGetPlaying,
+    EngineModelGetLooping,
+    EngineModelSetAnimRate,
+    EngineModelGetAnimRate,
+    EngineModelGetAnimIndex,
+    NULL
 };
 
 static bool LoadFearHost(void)
@@ -414,10 +792,13 @@ static bool LoadFearHost(void)
     g_pfnFearHostUpdate = (void (*)(void))GetProcAddress(g_hFearHost, "FearHost_Update");
     g_pfnFearHostOnKeyDown = (void (*)(int, int))GetProcAddress(g_hFearHost, "FearHost_OnKeyDown");
     g_pfnFearHostOnKeyUp = (void (*)(int))GetProcAddress(g_hFearHost, "FearHost_OnKeyUp");
+    g_pfnFearHostOnEvent = (void (*)(uint32, uint32))GetProcAddress(g_hFearHost, "FearHost_OnEvent");
     g_pfnFearHostOnMouseMove = (void (*)(int, int))GetProcAddress(g_hFearHost, "FearHost_OnMouseMove");
     g_pfnFearHostOnMouseButton = (void (*)(int, int, int, int))GetProcAddress(g_hFearHost, "FearHost_OnMouseButton");
+    g_pfnFearHostOnModelKey = (void (*)(void *, uint32, void *))GetProcAddress(g_hFearHost, "FearHost_OnModelKey");
     g_pfnFearHostOnEngineTerm = (void (*)(void))GetProcAddress(g_hFearHost, "FearHost_OnEngineTerm");
-    return g_pfnFearHostInit && g_pfnFearHostOnEngineInitialized && g_pfnFearHostUpdate;
+    return g_pfnFearHostInit && g_pfnFearHostOnEngineInitialized && g_pfnFearHostUpdate &&
+        g_pfnFearHostOnEvent;
 }
 
 static bool FearRetailAbiEnabled(void)
@@ -520,9 +901,35 @@ public:
             g_pfnFearHostOnKeyUp(key);
     }
 
+    void OnModelKey(HLOCALOBJ hObj, ArgList *pArgs) override
+    {
+        if (g_pfnFearHostOnModelKey)
+            g_pfnFearHostOnModelKey(hObj, MAIN_TRACKER, pArgs);
+    }
+
+    void OnEvent(uint32 dwEventID, uint32 dwParam) override
+    {
+        printf("FEARPORT: OnEvent id=%u param=%u\n", (unsigned)dwEventID, (unsigned)dwParam);
+        fflush(stdout);
+        if (g_pfnFearHostOnEvent)
+            g_pfnFearHostOnEvent(dwEventID, dwParam);
+    }
+
     void HandleEvent(SDL_Event e) override
     {
-        if (e.type == SDL_MOUSEMOTION)
+        if (e.type == SDL_KEYDOWN)
+        {
+            int nKey = FearSdlKeyToVk(e.key.keysym.sym);
+            if (nKey != 0 && g_pfnFearHostOnKeyDown)
+                g_pfnFearHostOnKeyDown(nKey, e.key.repeat ? 1 : 0);
+        }
+        else if (e.type == SDL_KEYUP)
+        {
+            int nKey = FearSdlKeyToVk(e.key.keysym.sym);
+            if (nKey != 0 && g_pfnFearHostOnKeyUp)
+                g_pfnFearHostOnKeyUp(nKey);
+        }
+        else if (e.type == SDL_MOUSEMOTION)
         {
             if (!g_bFearMouseInitialized)
             {
@@ -572,6 +979,12 @@ BOOL WINAPI DllMain(HINSTANCE hInstance, DWORD dwReason, LPVOID lpReserved)
         DisableThreadLibraryCalls(hInstance);
         g_hFearCrashHandler = AddVectoredExceptionHandler(1, FearCrashHandler);
         g_hFearWatchHandler = AddVectoredExceptionHandler(1, FearWatchHandler);
+        char szStackDiag[8] = {0};
+        if (GetEnvironmentVariableA("FEAR_STACK_DIAG", szStackDiag, sizeof(szStackDiag)) > 0 &&
+            szStackDiag[0] && szStackDiag[0] != '0')
+        {
+            signal(SIGABRT, FearAbortHandler);
+        }
     }
     else if (dwReason == DLL_PROCESS_DETACH)
     {

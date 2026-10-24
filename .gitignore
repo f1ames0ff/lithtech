@@ -7,5 +7,7 @@ Rez
 *.REZ
 .vscode
 .idea/
+.codex/
 .mcp.json
 codeblocks
+tmp/

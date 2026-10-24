@@ -13,6 +13,8 @@
 #include "iltmessage.h"
 #include "server_interface.h"
 
+extern "C" unsigned short FearClient_GetServerObjectId(HOBJECT hObject);
+
 typedef SI_CREATESTATUS(__cdecl *TFearCreateServer)(int, LTGUID &, ServerInterface **);
 typedef void(__cdecl *TFearDeleteServer)();
 typedef void(__thiscall *TFearStringCtor)(void *);
@@ -415,6 +417,10 @@ void FearServerHost_Update(void)
     if (!g_bServerRunning || !g_pServer)
         return;
 
+    static unsigned int s_nReceivedPlayerUpdates = 0;
+    static unsigned int s_nLoggedPlayerPositions = 0;
+    static unsigned int s_nLoggedServerSteps = 0;
+
     void *pShell = *(void **)((uintptr_t)g_hEngineServer + 0xF911C);
     if (pShell && g_hServerClient)
     {
@@ -434,16 +440,97 @@ void FearServerHost_Update(void)
                     fflush(stdout);
                     pMessage->SeekTo(0);
                 }
+                static unsigned int s_nRx100 = 0;
+                bool bPlayerUpdate = false;
+                {
+                    uint32 nSaved = pMessage->Tell();
+                    pMessage->SeekTo(0);
+                    uint32 nFirst = pMessage->ReadBits(8);
+                    pMessage->SeekTo(nSaved);
+                    if (nFirst == 100)
+                    {
+                        bPlayerUpdate = true;
+                        ++s_nRx100;
+                        ++s_nReceivedPlayerUpdates;
+                        if (s_nRx100 <= 3 || (s_nRx100 % 30) == 0)
+                        {
+                            printf("FEARRX: id=100 n=%u size=%u player=%p\n", s_nRx100, (unsigned)pMessage->Size(), g_hServerPlayer);
+                            fflush(stdout);
+                        }
+                    }
+                }
+
+                float vBefore[3] = {0.0f, 0.0f, 0.0f};
+                float vAfter[3] = {0.0f, 0.0f, 0.0f};
+                bool bHaveBefore = bPlayerUpdate && FearServerHost_GetPlayerTransform(vBefore, NULL);
+
                 void **pVtable = *(void ***)pShell;
                 typedef void(__thiscall *TOnMessage)(void *, void *, ILTMessage_Read *);
                 TOnMessage pfnOnMessage = (TOnMessage)pVtable[10];
                 pfnOnMessage(pShell, g_hServerClient, pMessage);
+
+                if (bPlayerUpdate && bHaveBefore && FearServerHost_GetPlayerTransform(vAfter, NULL))
+                {
+                    float fDeltaX = vAfter[0] - vBefore[0];
+                    float fDeltaY = vAfter[1] - vBefore[1];
+                    float fDeltaZ = vAfter[2] - vBefore[2];
+                    float fDeltaSqr = fDeltaX * fDeltaX + fDeltaY * fDeltaY + fDeltaZ * fDeltaZ;
+                    if ((fDeltaSqr > 0.01f) &&
+                        (s_nLoggedPlayerPositions < 30 || (s_nLoggedPlayerPositions % 120) == 0))
+                    {
+                        printf("FEARSERVER: player update=%u size=%u moved %.2f %.2f %.2f "
+                            "from=%.2f %.2f %.2f to=%.2f %.2f %.2f\n",
+                            s_nReceivedPlayerUpdates, (unsigned)pMessage->Size(),
+                            fDeltaX, fDeltaY, fDeltaZ,
+                            vBefore[0], vBefore[1], vBefore[2],
+                            vAfter[0], vAfter[1], vAfter[2]);
+                        fflush(stdout);
+                        ++s_nLoggedPlayerPositions;
+                    }
+                }
                 pMessage->Release();
             }
         }
     }
 
+    float vBeforeUpdate[3] = {0.0f, 0.0f, 0.0f};
+    const bool bHaveBeforeUpdate = FearServerHost_GetPlayerTransform(vBeforeUpdate, NULL);
     g_pServer->Update(0);
+    float vAfterUpdate[3] = {0.0f, 0.0f, 0.0f};
+    if (bHaveBeforeUpdate && FearServerHost_GetPlayerTransform(vAfterUpdate, NULL))
+    {
+        float fDeltaX = vAfterUpdate[0] - vBeforeUpdate[0];
+        float fDeltaY = vAfterUpdate[1] - vBeforeUpdate[1];
+        float fDeltaZ = vAfterUpdate[2] - vBeforeUpdate[2];
+        float fDeltaSqr = fDeltaX * fDeltaX + fDeltaY * fDeltaY + fDeltaZ * fDeltaZ;
+        if ((fDeltaSqr > 0.01f) &&
+            (s_nLoggedServerSteps < 30 || (s_nLoggedServerSteps % 120) == 0))
+        {
+            printf("FEARSERVER: step moved %.2f %.2f %.2f from=%.2f %.2f %.2f to=%.2f %.2f %.2f\n",
+                fDeltaX, fDeltaY, fDeltaZ,
+                vBeforeUpdate[0], vBeforeUpdate[1], vBeforeUpdate[2],
+                vAfterUpdate[0], vAfterUpdate[1], vAfterUpdate[2]);
+            fflush(stdout);
+            ++s_nLoggedServerSteps;
+        }
+    }
+
+    static bool s_bCamerasDumped = false;
+    char szDumpCameras[8] = {0};
+    if (!s_bCamerasDumped && g_bServerWorldLoaded &&
+        GetEnvironmentVariableA("FEAR_DUMP_CAMERAS", szDumpCameras, sizeof(szDumpCameras)) > 0 &&
+        szDumpCameras[0] && szDumpCameras[0] != '0')
+    {
+        HMODULE hGameServer = GetModuleHandleA("GameServer.dll");
+        if (hGameServer)
+        {
+            typedef int(__cdecl *TDumpCameras)(void);
+            TDumpCameras pfnDump = (TDumpCameras)GetProcAddress(hGameServer, "FearGameServer_DumpCameras");
+            if (pfnDump)
+                pfnDump();
+        }
+        s_bCamerasDumped = true;
+    }
 
     if (g_hServerClient)
     {
@@ -471,6 +558,28 @@ void FearServerHost_Update(void)
             }
         }
     }
+
+    static bool s_bStartupCommandQueued = false;
+    char szStartupCommand[2048] = {0};
+    if (!s_bStartupCommandQueued && g_hServerPlayer &&
+        GetEnvironmentVariableA("FEAR_QUEUE_COMMAND", szStartupCommand, sizeof(szStartupCommand)) > 0 &&
+        szStartupCommand[0])
+    {
+        HMODULE hGameServer = GetModuleHandleA("GameServer.dll");
+        if (hGameServer)
+        {
+            typedef void(__cdecl *TQueueCommand)(const char *);
+            TQueueCommand pfnQueue =
+                (TQueueCommand)GetProcAddress(hGameServer, "FearGameServer_QueueCommand");
+            if (pfnQueue)
+            {
+                pfnQueue(szStartupCommand);
+                printf("FEARSERVER: queued startup command '%s'\n", szStartupCommand);
+                fflush(stdout);
+            }
+        }
+        s_bStartupCommandQueued = true;
+    }
 }
 
 void FearServerHost_SubmitClientMessage(ILTMessage_Read *pMessage)
@@ -495,6 +604,387 @@ void FearServerHost_DeliverMessages(void)
             pMessage->Release();
         }
     }
+}
+
+int FearServerHost_VisitCameras(TFearServerObjectVisitor pVisitor, void *pContext)
+{
+    if (!g_bServerRunning || !g_bServerWorldLoaded || !pVisitor)
+        return 0;
+
+    HMODULE hGameServer = GetModuleHandleA("GameServer.dll");
+    if (!hGameServer)
+        return 0;
+
+    TFearGameServerVisitCameras pfnVisit =
+        (TFearGameServerVisitCameras)GetProcAddress(hGameServer, "FearGameServer_VisitCameras");
+    return pfnVisit ? pfnVisit(pVisitor, pContext) : 0;
+}
+
+int FearServerHost_VisitObjects(TFearServerObjectVisitor pVisitor, void *pContext)
+{
+    if (!g_bServerRunning || !g_bServerWorldLoaded || !pVisitor)
+        return 0;
+
+    HMODULE hGameServer = GetModuleHandleA("GameServer.dll");
+    if (!hGameServer)
+        return 0;
+
+    TFearGameServerVisitObjects pfnVisit =
+        (TFearGameServerVisitObjects)GetProcAddress(hGameServer, "FearGameServer_VisitObjects");
+    return pfnVisit ? pfnVisit(pVisitor, pContext) : 0;
+}
+
+void *FearServerHost_ResolveObject(unsigned short nObjectId)
+{
+    if (!g_bServerRunning || !g_bServerWorldLoaded || nObjectId == FEAR_INVALID_OBJECT_ID)
+        return NULL;
+
+    HMODULE hGameServer = GetModuleHandleA("GameServer.dll");
+    if (!hGameServer)
+        return NULL;
+
+    TFearGameServerResolveObject pfnResolve =
+        (TFearGameServerResolveObject)GetProcAddress(hGameServer, "FearGameServer_ResolveObject");
+    return pfnResolve ? pfnResolve(nObjectId) : NULL;
+}
+
+static void *FearServerHost_ResolveClientObject(void *pClientObject)
+{
+    HOBJECT hServerObject = (HOBJECT)FearServerHost_ResolveObject(
+        FearClient_GetServerObjectId((HOBJECT)pClientObject));
+    if (hServerObject)
+        return hServerObject;
+
+    HMODULE hGameClient = GetModuleHandleA("GameClient.dll");
+    if (hGameClient)
+    {
+        typedef void *(__cdecl *TGetLocalPlayerBody)();
+        TGetLocalPlayerBody pfnGetLocalPlayerBody =
+            (TGetLocalPlayerBody)GetProcAddress(hGameClient, "FearClient_GetLocalPlayerBody");
+        if (pfnGetLocalPlayerBody && pfnGetLocalPlayerBody() == pClientObject)
+            return g_hServerPlayer;
+    }
+
+    return NULL;
+}
+
+bool FearServerHost_GetAnimKeyFrame(
+    void *pClientObject, unsigned int nAnimation, unsigned int nKeyFrame,
+    unsigned int *pTime, char *pszKey, unsigned int nKeyLength)
+{
+    void *pObject = FearServerHost_ResolveClientObject(pClientObject);
+    if (!pObject || !pTime || !pszKey || !nKeyLength)
+        return false;
+
+    bool bResult = false;
+    __try
+    {
+        unsigned char *pBytes = (unsigned char *)pObject;
+        if (pBytes[87] != 1)
+            __leave;
+
+        unsigned char *pModel = *(unsigned char **)(pBytes + 272);
+        if (!pModel)
+            __leave;
+
+        unsigned char *pInfo = *(unsigned char **)(pModel + 100);
+        unsigned char *pInfoEnd = *(unsigned char **)(pModel + 104);
+        if (!pInfo || !pInfoEnd || pInfoEnd <= pInfo)
+            __leave;
+
+        unsigned int nAnimationCount = (unsigned int)(pInfoEnd - pInfo) / 8;
+        if (nAnimation >= nAnimationCount)
+            __leave;
+
+        unsigned char *pAnim = *(unsigned char **)(pInfo + nAnimation * 8 + 4);
+        if (!pAnim)
+            __leave;
+
+        unsigned int nKeyFrameCount = *(unsigned int *)(pAnim + 20);
+        if (nKeyFrame >= nKeyFrameCount)
+            __leave;
+
+        unsigned char *pRecord = pAnim + 40 + nKeyFrame * 8;
+        const char *pszSource = *(const char **)(pRecord + 4);
+        *pTime = *(unsigned int *)pRecord;
+        pszKey[0] = '\0';
+        if (pszSource)
+        {
+            unsigned int nCopy = 0;
+            while (nCopy + 1 < nKeyLength && pszSource[nCopy])
+            {
+                pszKey[nCopy] = pszSource[nCopy];
+                ++nCopy;
+            }
+            pszKey[nCopy] = '\0';
+        }
+        bResult = true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        bResult = false;
+    }
+    return bResult;
+}
+
+static HMODULE FearServerHost_GameServerModule(void)
+{
+    if (!g_bServerRunning || !g_bServerWorldLoaded)
+        return NULL;
+    return GetModuleHandleA("GameServer.dll");
+}
+
+bool FearServerHost_GetAnimLength(
+    void *pClientObject, unsigned int nAnimation, unsigned int *pLength)
+{
+    HMODULE hGameServer = FearServerHost_GameServerModule();
+    if (!hGameServer || !pClientObject || !pLength)
+        return false;
+
+    TFearGameServerGetAnimLength pfnGet =
+        (TFearGameServerGetAnimLength)GetProcAddress(hGameServer, "FearGameServer_GetAnimLength");
+    return pfnGet && pfnGet(FearServerHost_ResolveClientObject(pClientObject), nAnimation, pLength);
+}
+
+bool FearServerHost_GetAnimKeyFrames(
+    void *pClientObject, unsigned int nAnimation, unsigned int *pKeyFrames)
+{
+    HMODULE hGameServer = FearServerHost_GameServerModule();
+    if (!hGameServer || !pClientObject || !pKeyFrames)
+        return false;
+
+    TFearGameServerGetAnimKeyFrames pfnGet =
+        (TFearGameServerGetAnimKeyFrames)GetProcAddress(hGameServer, "FearGameServer_GetAnimKeyFrames");
+    return pfnGet && pfnGet(FearServerHost_ResolveClientObject(pClientObject), nAnimation, pKeyFrames);
+}
+
+bool FearServerHost_GetAnimNodeTransform(
+    void *pClientObject, unsigned int nAnimation, unsigned int nNode, unsigned int nKeyFrame,
+    float *pPosition, float *pRotation)
+{
+    HMODULE hGameServer = FearServerHost_GameServerModule();
+    if (!hGameServer || !pClientObject || !pPosition || !pRotation)
+        return false;
+
+    TFearGameServerGetAnimNodeTransform pfnGet =
+        (TFearGameServerGetAnimNodeTransform)GetProcAddress(
+            hGameServer, "FearGameServer_GetAnimNodeTransform");
+    return pfnGet && pfnGet(
+        FearServerHost_ResolveClientObject(pClientObject),
+        nAnimation, nNode, nKeyFrame, pPosition, pRotation);
+}
+
+bool FearServerHost_GetNodeTransform(
+    void *pClientObject, unsigned int nNode, float *pPosition, float *pRotation, bool bWorldSpace)
+{
+    HMODULE hGameServer = FearServerHost_GameServerModule();
+    if (!hGameServer || !pClientObject || !pPosition || !pRotation)
+        return false;
+
+    TFearGameServerGetNodeTransform pfnGet =
+        (TFearGameServerGetNodeTransform)GetProcAddress(
+            hGameServer, "FearGameServer_GetNodeTransform");
+    return pfnGet && pfnGet(
+        FearServerHost_ResolveClientObject(pClientObject),
+        nNode, pPosition, pRotation, bWorldSpace ? 1 : 0);
+}
+
+bool FearServerHost_GetBindPoseNodeTransform(
+    void *pClientObject, unsigned int nNode, float *pPosition, float *pRotation)
+{
+    HMODULE hGameServer = FearServerHost_GameServerModule();
+    if (!hGameServer || !pClientObject || !pPosition || !pRotation)
+        return false;
+
+    TFearGameServerGetBindPoseNodeTransform pfnGet =
+        (TFearGameServerGetBindPoseNodeTransform)GetProcAddress(
+            hGameServer, "FearGameServer_GetBindPoseNodeTransform");
+    return pfnGet && pfnGet(
+        FearServerHost_ResolveClientObject(pClientObject),
+        nNode, pPosition, pRotation);
+}
+
+static bool FearServerHost_NativeModelReady(void *pServerObject)
+{
+    __try
+    {
+        unsigned char *pObject = (unsigned char *)pServerObject;
+        if (!pObject || pObject[87] != 1)
+            return false;
+        unsigned char *pModel = *(unsigned char **)(pObject + 272);
+        if (!pModel)
+            return false;
+        unsigned int nNodeCount = *(unsigned int *)(pModel + 48);
+        return nNodeCount > 0 && nNodeCount <= 4096;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER)
+    {
+        return false;
+    }
+}
+
+bool FearServerHost_GetNodeTransformRaw(
+    void *pServerObject, unsigned int nNode, float *pPosition, float *pRotation, bool bWorldSpace)
+{
+    HMODULE hGameServer = FearServerHost_GameServerModule();
+    if (!hGameServer || !FearServerHost_NativeModelReady(pServerObject) ||
+        !pPosition || !pRotation)
+        return false;
+
+    TFearGameServerGetNodeTransform pfnGet =
+        (TFearGameServerGetNodeTransform)GetProcAddress(
+            hGameServer, "FearGameServer_GetNodeTransform");
+    return pfnGet && pfnGet(
+        pServerObject, nNode, pPosition, pRotation, bWorldSpace ? 1 : 0);
+}
+
+bool FearServerHost_GetBindPoseNodeTransformRaw(
+    void *pServerObject, unsigned int nNode, float *pPosition, float *pRotation)
+{
+    HMODULE hGameServer = FearServerHost_GameServerModule();
+    if (!hGameServer || !FearServerHost_NativeModelReady(pServerObject) ||
+        !pPosition || !pRotation)
+        return false;
+
+    TFearGameServerGetBindPoseNodeTransform pfnGet =
+        (TFearGameServerGetBindPoseNodeTransform)GetProcAddress(
+            hGameServer, "FearGameServer_GetBindPoseNodeTransform");
+    return pfnGet && pfnGet(pServerObject, nNode, pPosition, pRotation);
+}
+
+bool FearServerHost_GetNumNodesRaw(void *pServerObject, unsigned int *pNumNodes)
+{
+    HMODULE hGameServer = FearServerHost_GameServerModule();
+    if (!hGameServer || !FearServerHost_NativeModelReady(pServerObject) ||
+        !pNumNodes)
+        return false;
+
+    TFearGameServerGetNumNodes pfnGet =
+        (TFearGameServerGetNumNodes)GetProcAddress(
+            hGameServer, "FearGameServer_GetNumNodes");
+    return pfnGet && pfnGet(pServerObject, pNumNodes);
+}
+
+bool FearServerHost_GetMaterialFilenameRaw(
+    void *pServerObject, unsigned int nIndex, char *pszName, unsigned int nNameLength)
+{
+    HMODULE hGameServer = FearServerHost_GameServerModule();
+    if (!hGameServer || !FearServerHost_NativeModelReady(pServerObject) ||
+        !pszName || !nNameLength)
+        return false;
+
+    typedef int (__cdecl *TGetMaterialFilename)(
+        void *, unsigned int, char *, unsigned int);
+    TGetMaterialFilename pfnGet = (TGetMaterialFilename)GetProcAddress(
+        hGameServer, "FearGameServer_GetMaterialFilename");
+    return pfnGet && pfnGet(pServerObject, nIndex, pszName, nNameLength);
+}
+
+bool FearServerHost_DumpModelPiecesRaw(
+    void *pServerObject, unsigned int nMaxPieces)
+{
+    HMODULE hGameServer = FearServerHost_GameServerModule();
+    if (!hGameServer || !FearServerHost_NativeModelReady(pServerObject) ||
+        nMaxPieces == 0)
+        return false;
+
+    TFearGameServerDumpModelPieces pfnDump =
+        (TFearGameServerDumpModelPieces)GetProcAddress(
+            hGameServer, "FearGameServer_DumpModelPieces");
+    return pfnDump && pfnDump(pServerObject, nMaxPieces) >= 0;
+}
+
+bool FearServerHost_GetAnimIndex(
+    void *pClientObject, const char *pszName, unsigned int *pAnimation)
+{
+    HMODULE hGameServer = FearServerHost_GameServerModule();
+    if (!hGameServer || !pClientObject || !pszName || !pAnimation)
+        return false;
+
+    TFearGameServerGetAnimIndex pfnGet =
+        (TFearGameServerGetAnimIndex)GetProcAddress(hGameServer, "FearGameServer_GetAnimIndex");
+    return pfnGet && pfnGet(FearServerHost_ResolveClientObject(pClientObject), pszName, pAnimation);
+}
+
+bool FearServerHost_GetAnimName(
+    void *pClientObject, unsigned int nAnimation, char *pszName, unsigned int nNameLength)
+{
+    HMODULE hGameServer = FearServerHost_GameServerModule();
+    if (!hGameServer || !pClientObject || !pszName || !nNameLength)
+        return false;
+
+    TFearGameServerGetAnimName pfnGet =
+        (TFearGameServerGetAnimName)GetProcAddress(hGameServer, "FearGameServer_GetAnimName");
+    return pfnGet && pfnGet(
+        FearServerHost_ResolveClientObject(pClientObject),
+        nAnimation, pszName, nNameLength);
+}
+
+bool FearServerHost_GetModelAnimUserDims(
+    void *pClientObject, unsigned int nAnimation, float *pDims)
+{
+    HMODULE hGameServer = FearServerHost_GameServerModule();
+    if (!hGameServer || !pClientObject || !pDims)
+        return false;
+
+    TFearGameServerGetModelAnimUserDims pfnGet =
+        (TFearGameServerGetModelAnimUserDims)GetProcAddress(
+            hGameServer, "FearGameServer_GetModelAnimUserDims");
+    return pfnGet && pfnGet(
+        FearServerHost_ResolveClientObject(pClientObject),
+        nAnimation, pDims);
+}
+
+bool FearServerHost_GetSocket(
+    void *pClientObject, const char *pszName, unsigned int *pSocket)
+{
+    HMODULE hGameServer = FearServerHost_GameServerModule();
+    if (!hGameServer || !pClientObject || !pszName || !pSocket)
+        return false;
+
+    TFearGameServerGetSocket pfnGet =
+        (TFearGameServerGetSocket)GetProcAddress(hGameServer, "FearGameServer_GetSocket");
+    return pfnGet && pfnGet(FearServerHost_ResolveClientObject(pClientObject), pszName, pSocket);
+}
+
+bool FearServerHost_GetSocketTransform(
+    void *pClientObject, unsigned int nSocket, float *pPosition, float *pRotation, bool bWorldSpace)
+{
+    HMODULE hGameServer = FearServerHost_GameServerModule();
+    if (!hGameServer || !pClientObject || !pPosition || !pRotation)
+        return false;
+
+    TFearGameServerGetSocketTransform pfnGet =
+        (TFearGameServerGetSocketTransform)GetProcAddress(
+            hGameServer, "FearGameServer_GetSocketTransform");
+    return pfnGet && pfnGet(
+        FearServerHost_ResolveClientObject(pClientObject),
+        nSocket, pPosition, pRotation, bWorldSpace ? 1 : 0);
+}
+
+bool FearServerHost_GetNode(
+    void *pClientObject, const char *pszName, unsigned int *pNode)
+{
+    HMODULE hGameServer = FearServerHost_GameServerModule();
+    if (!hGameServer || !pClientObject || !pszName || !pNode)
+        return false;
+
+    TFearGameServerGetNode pfnGet =
+        (TFearGameServerGetNode)GetProcAddress(hGameServer, "FearGameServer_GetNode");
+    return pfnGet && pfnGet(
+        FearServerHost_ResolveClientObject(pClientObject), pszName, pNode);
+}
+
+bool FearServerHost_GetNumNodes(void *pClientObject, unsigned int *pNumNodes)
+{
+    HMODULE hGameServer = FearServerHost_GameServerModule();
+    if (!hGameServer || !pClientObject || !pNumNodes)
+        return false;
+
+    TFearGameServerGetNumNodes pfnGet =
+        (TFearGameServerGetNumNodes)GetProcAddress(hGameServer, "FearGameServer_GetNumNodes");
+    return pfnGet && pfnGet(
+        FearServerHost_ResolveClientObject(pClientObject), pNumNodes);
 }
 
 void FearServerHost_SetMessageSink(TFearServerMessageSink pSink)
@@ -560,8 +1050,40 @@ void *FearServerHost_GetPlayerObject(void)
 unsigned short FearServerHost_GetPlayerObjectId(void)
 {
     if (!g_hServerPlayer)
-        return 0xFFFF;
+        return FEAR_INVALID_OBJECT_ID;
+
+    HMODULE hGameServer = GetModuleHandleA("GameServer.dll");
+    if (hGameServer)
+    {
+        TFearGameServerObjectWireId pfnWireId =
+            (TFearGameServerObjectWireId)GetProcAddress(hGameServer, "FearGameServer_GetObjectWireId");
+        if (pfnWireId)
+        {
+            unsigned short nWireId = pfnWireId(g_hServerPlayer);
+            if (nWireId != FEAR_INVALID_OBJECT_ID)
+                return nWireId;
+        }
+    }
+
     return *(unsigned short *)((unsigned char *)g_hServerPlayer + 0x54);
+}
+
+unsigned short FearServerHost_GetLocalCharacterObjectId(void)
+{
+    HMODULE hGameServer = GetModuleHandleA("GameServer.dll");
+    if (hGameServer)
+    {
+        TFearGameServerGetLocalCharacterWireId pfnGetId =
+            (TFearGameServerGetLocalCharacterWireId)GetProcAddress(
+                hGameServer, "FearGameServer_GetLocalCharacterWireId");
+        if (pfnGetId)
+        {
+            unsigned short nCharacterId = pfnGetId();
+            if (nCharacterId != FEAR_INVALID_OBJECT_ID)
+                return nCharacterId;
+        }
+    }
+    return FearServerHost_GetPlayerObjectId();
 }
 
 bool FearServerHost_GetPlayerTransform(float *pPos, float *pRotation)
@@ -586,4 +1108,20 @@ bool FearServerHost_GetPlayerTransform(float *pPos, float *pRotation)
     }
 
     return true;
+}
+
+bool FearServerHost_SetPlayerTransform(
+    const float *pPos, const float *pVelocity, const float *pRotation)
+{
+    if (!g_hServerPlayer || !pPos || !g_bServerRunning)
+        return false;
+
+    HMODULE hGameServer = GetModuleHandleA("GameServer.dll");
+    if (!hGameServer)
+        return false;
+
+    TFearGameServerSetPlayerTransform pfnSetTransform =
+        (TFearGameServerSetPlayerTransform)GetProcAddress(
+            hGameServer, "FearGameServer_SetPlayerTransform");
+    return pfnSetTransform && pfnSetTransform(pPos, pVelocity, pRotation) != 0;
 }

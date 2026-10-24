@@ -10,8 +10,9 @@
 //
 // The sections between the node records and the geometry are not fully decoded,
 // so the geometry block is located by validating candidate (vertexBytes, faceBytes)
-// pairs against the face index range, then picking the stride that leaves the
-// least slack above the largest face index.  Two vertex profiles are in use:
+// pairs against the face index range.  The pair is not guaranteed to be DWORD-aligned,
+// and character files continue with animation data after the geometry.  Two vertex
+// profiles are in use:
 //   stride 32 - position, unit normal, u32 flag, u32 file id
 //   stride 48/64 - position followed by further vec3 rows; offset 12 is not a
 //                  normal there (the row is not unit length), so those meshes
@@ -21,6 +22,8 @@
 // than a corrupted mesh.  There are no texture coordinates in the container.
 
 #include "fear_model.h"
+#include "cshell_filemgr.h"
+#include "fear_world.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -36,12 +39,17 @@ struct FearModelVertex
     float x, y, z;
     float nx, ny, nz;
     DWORD color;
+    float u, v;
 };
 
 struct FearModelInstance
 {
     FearModel *m_pModel;
+    std::string m_Material;
     float m_Matrix[16];
+    std::vector<float> m_NodeMatrices;
+    IDirect3DVertexBuffer9 *m_pSkinnedVertexBuffer;
+    unsigned int m_nSkinnedVertexCapacity;
 };
 
 struct FearModel
@@ -50,9 +58,14 @@ struct FearModel
     std::vector<FearModelVertex> m_Vertices;
     std::vector<unsigned short> m_Indices;
     std::vector<std::string> m_NodeNames;
+    std::vector<unsigned char> m_SkinWeights;
+    std::vector<unsigned char> m_SkinBones;
     IDirect3DVertexBuffer9 *m_pVertexBuffer;
     IDirect3DIndexBuffer9 *m_pIndexBuffer;
     unsigned int m_nStride;
+    unsigned int m_nNodeCount;
+    bool m_bDrawLogged;
+    bool m_bSkinLogged;
     float m_BoundsMin[3];
     float m_BoundsMax[3];
 };
@@ -60,6 +73,15 @@ struct FearModel
 static FearModelInstance g_ModelInstances[FEAR_MODEL_MAX_INSTANCES];
 static int g_nModelInstances = 0;
 static std::vector<FearModel *> g_ModelCache;
+static std::vector<std::string> g_ModelFailures;
+
+struct FearModelMaterialTexture
+{
+    std::string m_Material;
+    IDirect3DTexture9 *m_pTexture;
+};
+
+static std::vector<FearModelMaterialTexture> g_MaterialTextures;
 
 static unsigned int FearModelU32(const unsigned char *p, size_t nOffset)
 {
@@ -88,21 +110,19 @@ static bool FearModelIsPlainFloat(float fValue)
 
 static bool FearModelReadFile(const char *pszPath, std::vector<unsigned char> &data)
 {
-    FILE *pFile = fopen(pszPath, "rb");
-    if (!pFile)
+    void *hFile = FearFile_Open(pszPath);
+    if (!hFile)
         return false;
-    fseek(pFile, 0, SEEK_END);
-    long nSize = ftell(pFile);
-    fseek(pFile, 0, SEEK_SET);
-    if (nSize < 64)
+    unsigned long long nSize = FearFile_Size(hFile);
+    if (nSize < 64 || nSize > 64ull * 1024ull * 1024ull)
     {
-        fclose(pFile);
+        FearFile_Close(hFile);
         return false;
     }
     data.resize((size_t)nSize);
-    size_t nRead = fread(&data[0], 1, (size_t)nSize, pFile);
-    fclose(pFile);
-    return nRead == (size_t)nSize;
+    bool bRead = FearFile_Read(hFile, data.data(), (unsigned int)nSize) != 0;
+    FearFile_Close(hFile);
+    return bRead;
 }
 
 static std::string FearModelDir()
@@ -128,10 +148,10 @@ static std::string FearModelBaseName(const char *pszName)
 
 static bool FearModelFileExists(const std::string &path)
 {
-    FILE *pFile = fopen(path.c_str(), "rb");
-    if (!pFile)
+    void *hFile = FearFile_Open(path.c_str());
+    if (!hFile)
         return false;
-    fclose(pFile);
+    FearFile_Close(hFile);
     return true;
 }
 
@@ -175,11 +195,8 @@ static bool FearModelFindGeometry(const std::vector<unsigned char> &data, size_t
     const unsigned char *p = &data[0];
     static const unsigned int s_Strides[] = { 32, 36, 40, 44, 48, 52, 56, 60, 64, 68, 72, 80, 96 };
 
-    if (nStart & 3)
-        nStart = (nStart + 3) & ~(size_t)3;
-
     bool bFound = false;
-    for (size_t o = nStart; o + 16 <= nSize; o += 4)
+    for (size_t o = nStart; o + 16 <= nSize; ++o)
     {
         unsigned int nVertexBytes = FearModelU32(p, o);
         unsigned int nFaceBytes = FearModelU32(p, o + 4);
@@ -191,7 +208,19 @@ static bool FearModelFindGeometry(const std::vector<unsigned char> &data, size_t
         if (nTriangles > 400000)
             continue;
         size_t nEnd = o + 8 + (size_t)nVertexBytes + (size_t)nFaceBytes;
-        if (nEnd > nSize || nSize - nEnd > 8192)
+        if (nEnd > nSize)
+            continue;
+
+        unsigned int nCandidateStride = 0;
+        for (unsigned int s = 0; s < sizeof(s_Strides) / sizeof(s_Strides[0]); ++s)
+        {
+            if (nVertexBytes % s_Strides[s] == 0)
+            {
+                nCandidateStride = s_Strides[s];
+                break;
+            }
+        }
+        if (!nCandidateStride)
             continue;
 
         const unsigned char *pFaces = p + o + 8 + nVertexBytes;
@@ -240,6 +269,8 @@ static bool FearModelBuildGeometry(FearModel *pModel, const std::vector<unsigned
     size_t nFaceStart = nVertexStart + hit.m_nVertexBytes;
 
     pModel->m_Vertices.resize(hit.m_nVertices);
+    pModel->m_SkinWeights.assign((size_t)hit.m_nVertices * 4, 0);
+    pModel->m_SkinBones.assign((size_t)hit.m_nVertices * 4, 0);
     float fSumNormal = 0.0f;
     for (unsigned int i = 0; i < hit.m_nVertices; ++i)
     {
@@ -257,6 +288,28 @@ static bool FearModelBuildGeometry(FearModel *pModel, const std::vector<unsigned
         else
         {
             v.nx = v.ny = v.nz = 0.0f;
+        }
+        v.u = hit.m_nStride >= 64 ? FearModelF32(pRecord, 24) : 0.0f;
+        v.v = hit.m_nStride >= 64 ? FearModelF32(pRecord, 28) : 0.0f;
+        if (!FearModelIsPlainFloat(v.u) || !FearModelIsPlainFloat(v.v))
+            v.u = v.v = 0.0f;
+        if (hit.m_nStride >= 64)
+        {
+            int nInfluences = 0;
+            int slots[4] = {0, 0, 0, 0};
+            for (int k = 0; k < 4; ++k)
+            {
+                if (pRecord[56 + k] != 0)
+                    slots[nInfluences++] = k;
+            }
+            for (int k = 0; k < nInfluences; ++k)
+            {
+                unsigned int nBone = pRecord[60 + nInfluences - 1 - k];
+                if (nBone >= pModel->m_nNodeCount)
+                    continue;
+                pModel->m_SkinWeights[i * 4 + k] = pRecord[56 + slots[k]];
+                pModel->m_SkinBones[i * 4 + k] = (unsigned char)nBone;
+            }
         }
         if (!FearModelIsPlainFloat(v.x) || !FearModelIsPlainFloat(v.y) || !FearModelIsPlainFloat(v.z))
             return false;
@@ -406,6 +459,7 @@ static bool FearModelParse(FearModel *pModel, const std::vector<unsigned char> &
         o = nEnd + 1;
     }
 
+    pModel->m_nNodeCount = nNodeCount;
     FearModelGeometryHit hit;
     if (!FearModelFindGeometry(data, nNodesEnd, hit))
         return false;
@@ -428,6 +482,9 @@ FearModel *FearModel_LoadFile(const char *pszPath)
     for (size_t i = 0; i < g_ModelCache.size(); ++i)
         if (g_ModelCache[i] && g_ModelCache[i]->m_Path == pszPath)
             return g_ModelCache[i];
+    for (size_t i = 0; i < g_ModelFailures.size(); ++i)
+        if (g_ModelFailures[i] == pszPath)
+            return NULL;
 
     std::vector<unsigned char> data;
     if (!FearModelReadFile(pszPath, data))
@@ -442,12 +499,16 @@ FearModel *FearModel_LoadFile(const char *pszPath)
     pModel->m_pVertexBuffer = NULL;
     pModel->m_pIndexBuffer = NULL;
     pModel->m_nStride = 0;
+    pModel->m_nNodeCount = 0;
+    pModel->m_bDrawLogged = false;
+    pModel->m_bSkinLogged = false;
 
     if (!FearModelParse(pModel, data))
     {
         printf("FEARMODEL: parse failed %s\n", pszPath);
         fflush(stdout);
         delete pModel;
+        g_ModelFailures.push_back(pszPath);
         return NULL;
     }
     g_ModelCache.push_back(pModel);
@@ -515,12 +576,15 @@ void FearModel_SetLights(const FearModelLight *pLights, int nCount, const float 
     (void)pAmbient;
 }
 
-void FearModel_Queue(FearModel *pModel, const float *pMatrix)
+void FearModel_Queue(FearModel *pModel, const char *pszMaterial, const float *pMatrix)
 {
     if (!pModel || g_nModelInstances >= FEAR_MODEL_MAX_INSTANCES)
         return;
     FearModelInstance &inst = g_ModelInstances[g_nModelInstances++];
+    const std::string material = pszMaterial ? pszMaterial : "";
+    inst.m_Material = material;
     inst.m_pModel = pModel;
+    inst.m_NodeMatrices.clear();
     if (pMatrix)
         memcpy(inst.m_Matrix, pMatrix, sizeof(inst.m_Matrix));
     else
@@ -530,6 +594,21 @@ void FearModel_Queue(FearModel *pModel, const float *pMatrix)
     }
 }
 
+void FearModel_QueueSkinned(FearModel *pModel, const char *pszMaterial, const float *pMatrix,
+    const float *pNodeMatrices, unsigned int nNodeCount)
+{
+    if (!pModel || !pNodeMatrices || nNodeCount == 0 ||
+        g_nModelInstances >= FEAR_MODEL_MAX_INSTANCES)
+        return;
+
+    if (nNodeCount > 256)
+        nNodeCount = 256;
+    FearModel_Queue(pModel, pszMaterial, pMatrix);
+    FearModelInstance &inst = g_ModelInstances[g_nModelInstances - 1];
+    inst.m_NodeMatrices.assign(
+        pNodeMatrices, pNodeMatrices + (size_t)nNodeCount * 16);
+}
+
 void FearModel_ClearQueue()
 {
     g_nModelInstances = 0;
@@ -537,9 +616,23 @@ void FearModel_ClearQueue()
 
 void FearModel_Shutdown()
 {
+    for (int i = 0; i < FEAR_MODEL_MAX_INSTANCES; ++i)
+    {
+        if (g_ModelInstances[i].m_pSkinnedVertexBuffer)
+        {
+            g_ModelInstances[i].m_pSkinnedVertexBuffer->Release();
+            g_ModelInstances[i].m_pSkinnedVertexBuffer = NULL;
+            g_ModelInstances[i].m_nSkinnedVertexCapacity = 0;
+        }
+    }
+    for (size_t i = 0; i < g_MaterialTextures.size(); ++i)
+        if (g_MaterialTextures[i].m_pTexture)
+            g_MaterialTextures[i].m_pTexture->Release();
+    g_MaterialTextures.clear();
     for (size_t i = 0; i < g_ModelCache.size(); ++i)
         FearModel_Release(g_ModelCache[i]);
     g_ModelCache.clear();
+    g_ModelFailures.clear();
     g_nModelInstances = 0;
 }
 
@@ -575,12 +668,14 @@ static const char *g_FearModelShaderSource =
     "row_major float4x4 g_WVP : register(c240);\n"
     "float4 g_Light : register(c244);\n"
     "float4 g_Tint : register(c245);\n"
-    "struct VS_IN { float3 pos : POSITION; float3 nrm : NORMAL; float4 col : COLOR0; };\n"
-    "struct VS_OUT { float4 pos : POSITION; float4 col : COLOR0; };\n"
+    "sampler2D g_Diffuse : register(s0);\n"
+    "struct VS_IN { float3 pos : POSITION; float3 nrm : NORMAL; float4 col : COLOR0; float2 uv : TEXCOORD0; };\n"
+    "struct VS_OUT { float4 pos : POSITION; float4 col : COLOR0; float2 uv : TEXCOORD0; };\n"
     "VS_OUT FearModelVS(VS_IN i)\n"
     "{\n"
     "    VS_OUT o;\n"
     "    o.pos = mul(float4(i.pos, 1.0), g_WVP);\n"
+    "    o.uv = i.uv;\n"
     "    float3 n = normalize(i.nrm);\n"
     "    if (g_Light.w > 0.5)\n"
     "    {\n"
@@ -595,7 +690,7 @@ static const char *g_FearModelShaderSource =
     "}\n"
     "float4 FearModelPS(VS_OUT i) : COLOR\n"
     "{\n"
-    "    return i.col;\n"
+    "    return tex2D(g_Diffuse, i.uv) * i.col;\n"
     "}\n";
 
 struct FearModelShaderState
@@ -604,6 +699,7 @@ struct FearModelShaderState
     IDirect3DVertexShader9 *m_pVS;
     IDirect3DPixelShader9 *m_pPS;
     IDirect3DVertexDeclaration9 *m_pDecl;
+    IDirect3DTexture9 *m_pWhite;
     bool m_bUsable;
     bool m_bTried;
 };
@@ -618,6 +714,8 @@ static void FearModelDestroyShaders()
         g_ModelShaders.m_pVS->Release();
     if (g_ModelShaders.m_pPS)
         g_ModelShaders.m_pPS->Release();
+    if (g_ModelShaders.m_pWhite)
+        g_ModelShaders.m_pWhite->Release();
     memset(&g_ModelShaders, 0, sizeof(g_ModelShaders));
 }
 
@@ -693,6 +791,20 @@ static bool FearModelInitShaders(IDirect3DDevice9 *pDevice)
             &g_ModelShaders.m_pPS);
     pVSBlob->Release();
     pPSBlob->Release();
+    if (SUCCEEDED(hr))
+        hr = pDevice->CreateTexture(1, 1, 1, 0, D3DFMT_A8R8G8B8, D3DPOOL_MANAGED,
+            &g_ModelShaders.m_pWhite, NULL);
+    if (SUCCEEDED(hr))
+    {
+        D3DLOCKED_RECT whiteRect;
+        memset(&whiteRect, 0, sizeof(whiteRect));
+        hr = g_ModelShaders.m_pWhite->LockRect(0, &whiteRect, NULL, 0);
+        if (SUCCEEDED(hr))
+        {
+            *(DWORD *)whiteRect.pBits = 0xffffffffu;
+            g_ModelShaders.m_pWhite->UnlockRect(0);
+        }
+    }
     if (FAILED(hr))
     {
         printf("FEARMODEL: shader creation failed hr=0x%08x\n", (unsigned int)hr);
@@ -706,6 +818,7 @@ static bool FearModelInitShaders(IDirect3DDevice9 *pDevice)
         { 0, 0,  D3DDECLTYPE_FLOAT3,   D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_POSITION, 0 },
         { 0, 12, D3DDECLTYPE_FLOAT3,   D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_NORMAL,   0 },
         { 0, 24, D3DDECLTYPE_D3DCOLOR, D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_COLOR,    0 },
+        { 0, 28, D3DDECLTYPE_FLOAT2,   D3DDECLMETHOD_DEFAULT, D3DDECLUSAGE_TEXCOORD, 0 },
         D3DDECL_END()
     };
     hr = pDevice->CreateVertexDeclaration(decl, &g_ModelShaders.m_pDecl);
@@ -773,6 +886,132 @@ static bool FearModelEnsureBuffers(IDirect3DDevice9 *pDevice, FearModel *pModel)
             return false;
     }
     return true;
+}
+
+static bool FearModelEnsureSkinnedBuffer(
+    IDirect3DDevice9 *pDevice, FearModelInstance &inst, unsigned int nVertexCount)
+{
+    if (inst.m_pSkinnedVertexBuffer &&
+        inst.m_nSkinnedVertexCapacity >= nVertexCount)
+        return true;
+
+    if (inst.m_pSkinnedVertexBuffer)
+    {
+        inst.m_pSkinnedVertexBuffer->Release();
+        inst.m_pSkinnedVertexBuffer = NULL;
+        inst.m_nSkinnedVertexCapacity = 0;
+    }
+
+    HRESULT hr = pDevice->CreateVertexBuffer(
+        nVertexCount * sizeof(FearModelVertex),
+        D3DUSAGE_DYNAMIC | D3DUSAGE_WRITEONLY,
+        D3DFVF_XYZ | D3DFVF_NORMAL | D3DFVF_DIFFUSE,
+        D3DPOOL_DEFAULT, &inst.m_pSkinnedVertexBuffer, NULL);
+    if (FAILED(hr))
+    {
+        printf("FEARMODEL: CreateSkinnedVertexBuffer(%u) failed hr=0x%08x\n",
+            nVertexCount, (unsigned int)hr);
+        fflush(stdout);
+        return false;
+    }
+
+    inst.m_nSkinnedVertexCapacity = nVertexCount;
+    return true;
+}
+
+static bool FearModelUpdateSkin(FearModelInstance &inst, FearModel *pModel)
+{
+    const unsigned int nVertexCount = (unsigned int)pModel->m_Vertices.size();
+    const unsigned int nNodeCount =
+        (unsigned int)(inst.m_NodeMatrices.size() / 16);
+    if (!nNodeCount || pModel->m_SkinWeights.size() != (size_t)nVertexCount * 4)
+        return false;
+
+    FearModelVertex *pDst = NULL;
+    if (FAILED(inst.m_pSkinnedVertexBuffer->Lock(
+        0, 0, (void **)&pDst, D3DLOCK_DISCARD)))
+        return false;
+
+    float boundsMin[3] = {1.0e30f, 1.0e30f, 1.0e30f};
+    float boundsMax[3] = {-1.0e30f, -1.0e30f, -1.0e30f};
+    for (unsigned int i = 0; i < nVertexCount; ++i)
+    {
+        const FearModelVertex &source = pModel->m_Vertices[i];
+        FearModelVertex &target = pDst[i];
+        float px = 0.0f, py = 0.0f, pz = 0.0f;
+        float nx = 0.0f, ny = 0.0f, nz = 0.0f;
+        float fTotalWeight = 0.0f;
+        for (int k = 0; k < 4; ++k)
+        {
+            const float fWeight = pModel->m_SkinWeights[i * 4 + k] / 255.0f;
+            const unsigned int nNode = pModel->m_SkinBones[i * 4 + k];
+            if (fWeight <= 0.0f || nNode >= nNodeCount)
+                continue;
+            const float *m = &inst.m_NodeMatrices[nNode * 16];
+            px += fWeight * (source.x * m[0] + source.y * m[4] + source.z * m[8] + m[12]);
+            py += fWeight * (source.x * m[1] + source.y * m[5] + source.z * m[9] + m[13]);
+            pz += fWeight * (source.x * m[2] + source.y * m[6] + source.z * m[10] + m[14]);
+            nx += fWeight * (source.nx * m[0] + source.ny * m[4] + source.nz * m[8]);
+            ny += fWeight * (source.nx * m[1] + source.ny * m[5] + source.nz * m[9]);
+            nz += fWeight * (source.nx * m[2] + source.ny * m[6] + source.nz * m[10]);
+            fTotalWeight += fWeight;
+        }
+
+        if (fTotalWeight > 0.0f)
+        {
+            target.x = px / fTotalWeight;
+            target.y = py / fTotalWeight;
+            target.z = pz / fTotalWeight;
+            target.nx = nx / fTotalWeight;
+            target.ny = ny / fTotalWeight;
+            target.nz = nz / fTotalWeight;
+        }
+        else
+        {
+            target = source;
+        }
+        target.color = source.color;
+        const float position[3] = {target.x, target.y, target.z};
+        for (int k = 0; k < 3; ++k)
+        {
+            if (position[k] < boundsMin[k]) boundsMin[k] = position[k];
+            if (position[k] > boundsMax[k]) boundsMax[k] = position[k];
+        }
+    }
+
+    if (FAILED(inst.m_pSkinnedVertexBuffer->Unlock()))
+        return false;
+    if (!pModel->m_bSkinLogged)
+    {
+        pModel->m_bSkinLogged = true;
+        printf("FEARMODEL: skin %s bbox=(%.1f %.1f %.1f)-(%.1f %.1f %.1f)\n",
+            pModel->m_Path.c_str(),
+            boundsMin[0], boundsMin[1], boundsMin[2],
+            boundsMax[0], boundsMax[1], boundsMax[2]);
+        fflush(stdout);
+    }
+    return true;
+}
+
+static IDirect3DTexture9 *FearModelGetMaterialTexture(
+    IDirect3DDevice9 *pDevice, const std::string &material)
+{
+    if (material.empty())
+        return NULL;
+    for (size_t i = 0; i < g_MaterialTextures.size(); ++i)
+    {
+        if (_stricmp(g_MaterialTextures[i].m_Material.c_str(), material.c_str()) == 0)
+            return g_MaterialTextures[i].m_pTexture;
+    }
+
+    FearModelMaterialTexture entry;
+    entry.m_Material = material;
+    entry.m_pTexture = FearWorld_LoadMaterialTexture(pDevice, material.c_str());
+    g_MaterialTextures.push_back(entry);
+    printf("FEARMODEL: texture material='%s' loaded=%d\n",
+        material.c_str(), entry.m_pTexture ? 1 : 0);
+    fflush(stdout);
+    return entry.m_pTexture;
 }
 
 void FearModel_RenderQueued(IDirect3DDevice9 *pDevice, const float *pView, const float *pProj,
@@ -866,14 +1105,15 @@ void FearModel_RenderQueued(IDirect3DDevice9 *pDevice, const float *pView, const
     pDevice->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
     pDevice->SetRenderState(D3DRS_STENCILENABLE, FALSE);
     pDevice->SetTexture(0, NULL);
-    pDevice->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG2);
+    pDevice->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_MODULATE);
+    pDevice->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_TEXTURE);
     pDevice->SetTextureStageState(0, D3DTSS_COLORARG2, D3DTA_DIFFUSE);
     pDevice->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
     for (unsigned int nStage = 1; nStage < 4; ++nStage)
         pDevice->SetTextureStageState(nStage, D3DTSS_COLOROP, D3DTOP_DISABLE);
-    pDevice->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
-    pDevice->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
-    pDevice->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+    pDevice->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_LINEAR);
+    pDevice->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_LINEAR);
+    pDevice->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_LINEAR);
 
     for (int i = 0; i < g_nModelInstances; ++i)
     {
@@ -882,12 +1122,32 @@ void FearModel_RenderQueued(IDirect3DDevice9 *pDevice, const float *pView, const
         if (!pModel || !FearModelEnsureBuffers(pDevice, pModel))
             continue;
 
+        IDirect3DVertexBuffer9 *pVertexBuffer = pModel->m_pVertexBuffer;
+        bool bSkinned = inst.m_NodeMatrices.size() >= 16 &&
+            pModel->m_SkinWeights.size() == pModel->m_Vertices.size() * 4;
+        if (bSkinned &&
+            FearModelEnsureSkinnedBuffer(
+                pDevice, inst, (unsigned int)pModel->m_Vertices.size()) &&
+            FearModelUpdateSkin(inst, pModel))
+        {
+            pVertexBuffer = inst.m_pSkinnedVertexBuffer;
+        }
+        else
+        {
+            bSkinned = false;
+        }
+
+        IDirect3DTexture9 *pMaterialTexture =
+            FearModelGetMaterialTexture(pDevice, inst.m_Material);
+        pDevice->SetTexture(0, pMaterialTexture ?
+            pMaterialTexture : g_ModelShaders.m_pWhite);
+
         float wvp[16];
         FearModelMatrixMultiply(inst.m_Matrix, viewProj, wvp);
         pDevice->SetTransform(D3DTS_WORLD, (const D3DMATRIX *)inst.m_Matrix);
         if (bShader)
             pDevice->SetVertexShaderConstantF(240, wvp, 4);
-        pDevice->SetStreamSource(0, pModel->m_pVertexBuffer, 0, sizeof(FearModelVertex));
+        pDevice->SetStreamSource(0, pVertexBuffer, 0, sizeof(FearModelVertex));
         pDevice->SetIndices(pModel->m_pIndexBuffer);
         HRESULT hrDraw;
         unsigned int nTris = (unsigned int)(pModel->m_Indices.size() / 3);
@@ -920,10 +1180,9 @@ void FearModel_RenderQueued(IDirect3DDevice9 *pDevice, const float *pView, const
             hrDraw = s_nNoDraw ? 0 : pDevice->DrawIndexedPrimitive(D3DPT_TRIANGLELIST, 0, 0,
                 (UINT)pModel->m_Vertices.size(), 0, nTris);
         }
-        static bool s_bLogged = false;
-        if (!s_bLogged)
+        if (!pModel->m_bDrawLogged)
         {
-            s_bLogged = true;
+            pModel->m_bDrawLogged = true;
             const FearModelVertex &v0 = pModel->m_Vertices[0];
             float out[4];
             for (int c = 0; c < 4; ++c)
@@ -951,8 +1210,9 @@ void FearModel_RenderQueued(IDirect3DDevice9 *pDevice, const float *pView, const
                 if (o[3] < wMin) wMin = o[3];
                 if (o[3] > wMax) wMax = o[3];
             }
-            printf("FEARMODEL: draw hr=0x%08x verts=%u tris=%u ndc0=(%.3f,%.3f,%.3f,w=%.2f) "
+            printf("FEARMODEL: draw %s skinned=%u hr=0x%08x verts=%u tris=%u ndc0=(%.3f,%.3f,%.3f,w=%.2f) "
                 "ndcbox=(%.3f,%.3f)-(%.3f,%.3f) w=[%.2f..%.2f] color=0x%08x\n",
+                pModel->m_Path.c_str(), bSkinned ? 1u : 0u,
                 (unsigned int)hrDraw, (unsigned int)pModel->m_Vertices.size(),
                 (unsigned int)(pModel->m_Indices.size() / 3),
                 out[0] / out[3], out[1] / out[3], out[2] / out[3], out[3],

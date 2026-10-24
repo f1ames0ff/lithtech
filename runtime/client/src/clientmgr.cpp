@@ -1685,6 +1685,10 @@ LTRESULT CClientMgr::LoadModelData(FileIdentifier *pIdent, Model* &pModel)
     request.m_pFile = client_file_mgr->OpenFileIdentifier(pIdent);
     if (!request.m_pFile)
     {
+        printf("FEARMODEL: OpenFileIdentifier failed file='%s' id=%u\n",
+            pFilename ? pFilename : "",
+            (unsigned)pIdent->m_FileID);
+        fflush(stdout);
         SetupError(LT_MISSINGMODELFILE, pFilename);
         RETURN_ERROR_PARAM(1, LoadModelData, LT_MISSINGMODELFILE, pFilename);
     }
@@ -1704,6 +1708,14 @@ LTRESULT CClientMgr::LoadModelData(FileIdentifier *pIdent, Model* &pModel)
 
     if (dResult != LT_OK )
     {
+        static int s_nLoadFailureLogs = 0;
+        if (s_nLoadFailureLogs < 64)
+        {
+            ++s_nLoadFailureLogs;
+            printf("FEARMODEL: Model::Load failed file='%s' result=%d\n",
+                pFilename ? pFilename : "", (int)dResult);
+            fflush(stdout);
+        }
         delete pModel;
 		pModel = NULL ;
         DEBUG_MODEL_REZ(("Error %d loading model %s", dResult, pFilename));
@@ -1711,12 +1723,18 @@ LTRESULT CClientMgr::LoadModelData(FileIdentifier *pIdent, Model* &pModel)
     }
     else if (!request.m_bTreesValid)
     {
+        printf("FEARMODEL: Model children invalid file='%s'\n",
+            pFilename ? pFilename : "");
+        fflush(stdout);
         delete pModel;
         DEBUG_MODEL_REZ(("Child model trees invalid in model %s", pFilename));
         RETURN_ERROR(1, LoadModelData, LT_INVALIDMODELFILE);
     }
     else if (!request.m_bAllChildrenLoaded)
     {
+        printf("FEARMODEL: Model children missing file='%s'\n",
+            pFilename ? pFilename : "");
+        fflush(stdout);
         delete pModel;
         DEBUG_MODEL_REZ(("Missing one or more child models in model %s", pFilename));
         RETURN_ERROR(1, LoadModelData, LT_INVALIDMODELFILE);

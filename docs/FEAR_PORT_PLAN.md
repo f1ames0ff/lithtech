@@ -1439,3 +1439,738 @@ Soak `inp33` / `walk2` (`FEAR_AUTOSTART=1;FEAR_LOCAL_PLAYER=1;FEAR_AUTOWALK=420,
 - A plain autostart soak (`def1`) without `FEAR_LOCAL_PLAYER` walks the player
   17600 units and stops cleanly, with `playerstate=1 inworld=1 gs=1` and no
   crash.
+
+## Iteration 17 - Message ownership and authoritative movement
+
+Date: 2026-10-23
+
+### Root cause fixed
+
+`CFearCommon::CreateMessage()` returned a single global `CFearMessageWrite`
+and reset it on every call; `CFearMessageWrite::Read()` returned a single
+global `CFearMessageRead`. `CAutoMessage` stores the writer pointer, so the
+nested camera/animation/move messages inside `CPlayerMgr::UpdatePlayerInfo`
+destroyed the outer `MID_PLAYER_UPDATE` header. The first byte of the
+movement packet became `m_ClientMoveCode` (observed ids 1 and 2), and
+`CGameServerShell::OnMessage` ignored those packets through `default`.
+
+Fix:
+
+- every `CreateMessage()` returns a new heap `CFearMessageWrite`;
+- every `Read()` returns a new heap `CFearMessageRead` owning a copy of the
+  current bit buffer;
+- both classes implement ref-counted `AddRef`/`Release`/`StaticRelease`/`Free`;
+- the global writer/reader instances were removed.
+
+### Evidence
+
+Unsampled telemetry was added to `CFearClient::SendToServer` (FEARTX) and to
+the server message sink (FEARRX), counting every `id=100` packet:
+
+| Metric | Value |
+|---|---|
+| FEARTX id=100 / FEARRX id=100 (30 s run) | 210 / 210 |
+| FEARTX id=100 / FEARRX id=100 (60 s soak) | 570 / 570 |
+| Server player z, 60 s soak | -370 -> 20252 |
+| Assertions in 60 s soak | 0 |
+| Process state after 60 s | alive, responding |
+
+The server transform now advances with the client: authoritative movement
+works for the first time.
+
+### Follow-up found by the fix
+
+Once movement packets were valid, the server sent a player text/credits
+event. The client crashed in `CreditOrder::StartEntry` because the database
+record handle from the message did not resolve to a valid `CreditOrder`
+record (`std::vector` subscript assertion inside `GetNumValues`). Credits
+playback is therefore temporarily disabled behind `FEAR_CREDITS`
+(default off) with a one-line diagnostic. This is a database index/category
+mapping issue, not a movement issue.
+
+### Remaining P0
+
+1. Fix `HRECORD`/category mapping so `TEXT`/credits records resolve to valid
+   client database records; re-enable credits.
+2. Implement client collision (`ILTClient::IntersectSegment`,
+   `GetStandingOn`): the player currently walks through the world to
+   z=20252.
+3. Resolve the predicted move object vs replicated server proxy ownership
+   (`CCharacterFX` is built over the move object, `GetClientObject()` is a
+   separate handle).
+4. Then remove the remaining gameplay message filters and continue with
+   object replication, models/animation, weapons and AI.
+
+## Iteration 18 - Client collision from v113 geometry
+
+Date: 2026-10-23
+
+### Implementation
+
+`ILTClient::IntersectSegment` now performs a real raycast against the parsed
+v113 world instead of returning the stub default:
+
+- all world triangles (58,355) are copied into a collision list at world
+  load;
+- a uniform XZ grid (257 x 163 cells, 256 units) indexes the triangles;
+- the segment is sampled through grid cells and tested with a two-sided
+  Moller-Trumbore intersection; the nearest hit wins;
+- `FearEngineApi::IntersectWorld` exposes the raycast to `FearHost`;
+- `CFearClient::IntersectSegment` fills `IntersectInfo` (point, plane,
+  object/poly defaults);
+- `CFearPhysics::GetStandingOn` casts a 64-unit down ray and reports the hit
+  plane;
+- `CFearPhysics::MoveObject` clamps the destination to the hit point plus a
+  1-unit offset and removes the velocity component into the surface.
+
+### Self-test at world load
+
+```
+FEARCOLL: triangles=58355 grid=257x163 cell=256
+FEARCOLLTEST: dir=0 hit=1 dist=2518.8   (+X wall)
+FEARCOLLTEST: dir=1 hit=0               (-X open)
+FEARCOLLTEST: dir=2 hit=1 dist=3250.0   (+Z wall at z=2880)
+FEARCOLLTEST: dir=3 hit=1 dist=1157.0   (-Z wall at z=-1527)
+```
+
+### Runtime evidence
+
+With `W` held, the server player previously walked past the level to
+`z=20252`. Now:
+
+```
+FEARPHYS: clamp n=1 from z=2872 to z=2916 hit z=2880
+serverframe=360 pos=-1100 -1436 2879
+serverframe=420 pos=-1100 -1436 2879
+```
+
+The authoritative player stops at the wall and stays there; no assertions
+in the run.
+
+### Remaining
+
+1. HRECORD/category mapping for credits/text (currently `FEAR_CREDITS` off).
+2. Predicted move object vs replicated server proxy ownership.
+3. Message filters and object replication; then models/animation, weapons,
+   AI and cutscenes.
+
+## Iteration 19 - Engine object SFX and cinematic cameras
+
+Date: 2026-10-23
+
+### Root cause
+
+The local server was submitting game-level messages to `IClientShell::OnMessage`,
+but it was not reproducing the engine object stream. In particular, the client
+never received the per-object SFX payloads installed with
+`ILTServer::SetObjectSFXMessage`. That payload is what creates the client-side
+camera, character and effect proxies before the first scripted frame.
+
+The server's world objects also have no network object IDs in this local
+in-process setup, so `ILTMessage_Write::WriteObject` returns zero for the
+world cameras. The compatibility bridge therefore keys the initial replicated
+objects by `HOBJECT` identity and assigns private client-side proxy IDs in the
+range `0x4000..`.
+
+### Implementation
+
+`FEAR/Compat/publictools_server/fear_server_bridge.cpp` walks the live
+`ILTServer` object list and copies camera state:
+
+- object handle, name and class;
+- `OFT_Flags`, `OFT_Flags2` and `OFT_User`;
+- position and rotation;
+- the exact engine SFX bitstream from `GetObjectSFXMessage`.
+
+`FearHost` resolves a client proxy for each server camera and forwards
+`SpecialEffectNotify` once. Flags and transforms are refreshed every other
+frame. A camera that leaves the server list has its user flags cleared.
+
+`FearClient_ApplyServerCamera` applies the same flag mask and rigid transform
+to the client object before creating the source `CCameraFX`.
+
+### Runtime evidence
+
+The `Intro` world contains four real `Camera` objects. The initial server
+snapshot is:
+
+```
+100_VisionCam01   user=00000000
+SecretCam         user=00000000
+trans_cam01       user=00000000
+intro_cam01       user=00000010
+```
+
+After the snapshot is applied:
+
+```
+FEARPORT: camera proxy id=16387 name='intro_cam01' user=00000010
+FEARPORT: timing sec=7.690 moveallowed=0 cammode=2
+FEARPORT: cam pos=-29200.00 -1636.00 3480.00 fwd=0.000 0.000 1.000
+```
+
+The source camera then follows the authored keyframes through the level
+instead of remaining at the player spawn. Representative transforms:
+
+```
+-24000.14 -1905.74 4217.68
+-27352.81 -1689.17 6797.66
+-22815.00 -1857.79 9520.15
+-20529.95 -1380.97 9020.45
+```
+
+The client remains in `kCM_Cinematic`, `AllowPlayerMovement` is false, and the
+movement filter reports `moveallowed=0`. Frame captures show the authored
+intro environment while the camera advances; early frames are black because
+the intro starts with a fade.
+
+The cinematic ends through the source trigger chain rather than a host-side
+timer:
+
+```
+FEARPORT: timing sec=7.690  moveallowed=0 cammode=2
+FEARPORT: timing sec=176.xxx moveallowed=0 cammode=2
+FEARPORT: timing sec=179.373 moveallowed=1 cammode=0
+FEARPORT: cam pos=-1100.00 -1354.00 -340.00
+```
+
+The client returns to the player camera at the authored start point and then
+runs the briefing dialogue sequence.
+
+The client sound implementation does not currently generate playback
+completion messages, so server dialogue objects would remain active forever.
+`Character.cpp` now starts the existing `m_tmrDialogue` watchdog when dialogue
+begins. The default is 4 seconds per line and can be overridden with
+`FEAR_DIALOGUE_TIMEOUT`. A 2-second run advanced through entries
+`15000..15006`, then the briefing sequence `15007..`, and allowed the intro
+cleanup path to complete.
+
+### Next
+
+1. Replicate the remaining object SFX classes (characters, props and instant
+   effects) and remove the `MID_SFX_MESSAGE` filter.
+2. Validate that dialogue completion advances the intro trigger chain and
+   reaches the first mission transition.
+3. Restore credits/text record resolution.
+
+## Iteration 20 - Display modes, render lifecycle and authored intro cleanup
+
+Date: 2026-10-24
+
+### Display mode contract
+
+The v5 renderer now enumerates the actual D3D9 modes instead of returning an
+empty list. On the test adapter the list contains 38 color modes, from
+`640x480x32` through `3840x2160x32`.
+
+`ILTClient::QueryPerformanceStats` is no longer a stub. The compatibility
+layer reports:
+
+- CPU frequency and processor count from Win32;
+- physical memory from `GlobalMemoryStatusEx`;
+- pixel and vertex shader caps from D3D9;
+- GPU memory from DXGI adapter descriptions.
+
+The 32-bit DXGI path reports `4095 MB` for the tested 16 GB adapter, which is
+enough for FEAR's memory estimate. The previous zero-byte GPU report produced
+the false "not enough video card memory" warning in Display Options.
+
+Server lifecycle events are now forwarded from the v4 CShell proxy into the
+v5 `IClientShell::OnEvent`. In particular, `LTEVENT_RENDERTERM` and
+`LTEVENT_RENDERINIT` reach `CGameClientShell`; `IsRendererInitted()` is true
+when `CUserProfile::ApplyDisplay()` runs.
+
+`CRenderTargetMgr::RemoveRenderTarget()` previously deleted a render target
+without erasing its map node. The next device reset dereferenced the stale
+pointer in `FreeRenderTargets()`. The map entry is now erased with the object.
+
+Verified switch:
+
+```text
+FEARPERF: quick=1 ... gpu=4095MB
+FEARPORT: SetRenderMode 1920x1080@32 hw=1
+FEARPORT: OnEvent id=4 param=0
+FEARPORT: OnEvent id=5 param=0
+FEARPORT: OnEvent id=3 param=0
+FEARPORT: SetRenderMode 1680x1050@32 hw=1
+client rect: 1680x1050
+```
+
+### Object SFX routing
+
+`FearHost` was dropping `MID_SFX_MESSAGE` (231), so the client never received
+character dialogue SFX. Message 231 now enters the normal
+`CGameClientShell -> CSFXMgr` path.
+
+FEAR 1.08 uses a 15-bit server object ID in serialized messages. The source
+Enterprise implementation uses 16 bits, which left the following CFX opcode
+shifted and also made every probe of a valid local player return `0xFFFF`.
+`FearGameServer_ResolveObject` resolves the corrected ID against the live
+`ILTServer` object list, and `CFearMessageRead::ReadObject()` uses that
+resolution for client-originated object messages.
+
+### Authored Intro evidence
+
+A clean auto-start run reached the authored investigation sequence and then
+the first cleanup:
+
+```text
+FEARDLG: StartDialogue ... index=0
+FEARDLG: StartDialogue ... index=1
+FEARDLG: StartDialogue ... index=2
+...
+FEARSERVER: FollowLure obj=...
+FEARSERVER: SetPhysicsModel old=0 new=1
+...
+FEARPORT: timing sec=187.537 moveallowed=1 cammode=0
+FEARSERVER: SetPhysicsModel old=1 new=0
+FEARPORT: physics update change=0010 model=0
+FEARPORT: movehold physics=0 ...
+```
+
+The process remained responsive for more than 400 seconds. A later state was
+`pos=-818.09 -1436.00 -286.79`, `physics=0`, `vehicle=0`, `allowed=1`.
+Working set stayed near 370 MB and virtual memory near 782 MB, so the previous
+2 GB texture-allocation failure did not recur.
+
+The dialogue watchdog is retained only as a safety fallback. Direct
+`MID_OBJECT_MESSAGE` completion is now verified through the source
+`CCharacter::HandleSfxMessage` path; it no longer depends on the watchdog.
+
+### Next
+
+1. Trace why the postload/briefing visual remains present in desktop captures
+   after `GS_PLAYING`, while the player and physics state are already active.
+2. Validate forward/strafe input against the live server player position.
+3. Continue with local character objects, view models, weapons and level
+   transition replication.
+
+## Iteration 21 - 15-bit object links and dialogue completion
+
+Date: 2026-10-24
+
+### Protocol correction
+
+A raw message dump showed the following prefix for the player object:
+
+```text
+bits  0..7   SFX_CHARACTER_ID = 11
+bits  8..22  object ID        = 6963
+bits 23..28  CFX_DIALOGUE_MSG = 12
+```
+
+Reading 16 object bits consumed the first CFX bit and produced misleading
+opcodes such as 6 and 38. The invalid-object sentinel is `0x7FFF`. This
+affected both server-to-client SFX routing and client-to-server dialogue
+completion.
+
+The compatibility message classes and server object inspection now use 15
+bits consistently:
+
+```text
+CFearMessageWrite::WriteObject
+CFearMessageRead::ReadObject
+FearServerObjectId
+FearGameServer_GetObjectWireId
+FearGameServer_ResolveObject
+```
+
+After the correction, server lookup resolved the local character as ID `6963`,
+and the client created its `CCharacterFX` over the corresponding mapped object.
+
+### Completion evidence
+
+The first authored briefing dialogue was run with a 30-second watchdog, which
+is longer than the observed progression interval:
+
+```text
+FEARDLG: StartDialogue ... index=0
+FEARDLG: start sound='15854' type=3 timeout=30.00
+FEARDLG: sfx message type=11 rawid=6963 object=01364820
+FEARDLG: sfx lookup type=11 object=01364820 fx=194D1B04
+FEARPORT: client message id=159 count=1
+FEARDLG: server completion sender=18DB362C id=1 expected=1
+FEARDLG: server kill sound id=1 type=3
+```
+
+The next source dialogue started without a timeout:
+
+```text
+FEARDLG: StartDialogue ... index=0
+FEARDLG: start sound='15855' type=3 timeout=30.00
+FEARDLG: server completion sender=18DB362C id=2 expected=2
+FEARDLG: server kill sound id=2 type=3
+```
+
+The run later reached the authored camera handoff and gameplay state without
+any `FEARDLG: timeout` entries:
+
+```text
+FEARSERVER: FollowLure ...
+FEARSERVER: SetPhysicsModel old=0 new=1
+FEARPORT: timing sec=242.119 moveallowed=1 cammode=0
+```
+
+The sound backend still returns `LT_UNSUPPORTED`, so voice audio is not yet
+audible. The client correctly treats the missing handle as completion and
+uses the source completion message path.
+
+## Iteration 22 - Object replication, movement and model API boundary
+
+Date: 2026-10-24
+
+### Generic object replication
+
+The server bridge now exports `FearGameServer_VisitObjects`. It walks live
+engine objects, skips cameras and objects without a serializable wire ID, and
+snapshots every object that has an engine SFX payload.
+
+Before initial server messages are delivered, the host maps each object by its
+15-bit wire ID, applies flags/transform, and passes the original payload to
+`CSpecialEffectNotify`. This creates the source client FX classes instead of
+manufacturing them from server class names.
+
+The Intro snapshot currently contains 144 replicated objects:
+
+```text
+FEARPORT: initial object replication complete count=144
+FEARPORT: object proxy id=6963 ... class='CPlayerObj' name='Player' sfx=11
+FEARPORT: object proxy id=1849 ... class='CAI' name='IntroBetters' sfx=11
+FEARPORT: object proxy id=1847 ... class='CAI' name='IntroJankowski' sfx=11
+FEARPORT: object proxy id=1845 ... class='CAI' name='IntroJin' sfx=11
+```
+
+`FEARPORT: authoritative character sfx ... fx=<non-null>` confirms that the
+source `CSFXMgr` creates `CCharacterFX` instances for the authoritative
+payloads. Props and player-lure proxies are replicated through the same path.
+
+### Gameplay input evidence
+
+A deterministic W test was scheduled after the cinematic:
+
+```text
+FEARPORT: queued key down frame=22300 vk=87
+FEARPORT: input bindings=1 forward=1
+FEARPORT: movegate allow=1 damage=1 flags=00000a01
+PHYS: move dt=0.1000 ... vel=0.0 0.0 300.0 off=0.00 0.00 30.00
+```
+
+The server position changed along the forward axis and stopped at a collision:
+
+```text
+before: -1100.00 -1436.00 -370.00
+during: -1100.00 -1436.00 2879.00
+```
+
+Later W presses hold the player at the wall while `FEARPHYS` collision counts
+continue to increase. This verifies binding lookup, control flags, physics
+velocity/offset and authoritative movement rather than camera-only motion.
+
+### ILTModel compatibility result
+
+The v4 CShell exposes `ILTClient::GetModelLT()`. Returning that pointer as a v5
+`ILTModel` is not ABI-safe: the client fails with "Run-Time Check Failure #0"
+and then crashes in `CCharacterFX::Init`.
+
+That experiment was reverted. The stable build keeps `CFearModel` as the
+fallback. Restoring animation, sockets and node transforms requires an explicit
+v4/v5 vtable adapter validated against the shipped executable, not a direct
+pointer cast.
+
+### Current boundary
+
+- Intro object replication and authoritative gameplay movement work.
+- `ILTModel` animation calls still hit the stub layer.
+- Sound playback remains `LT_UNSUPPORTED`; dialogue completion is functional.
+- Visual parity, weapons, AI behavior and level transitions remain open.
+
+## Iteration 23 - Stable movement, server sync and frame timing
+
+Date: 2026-10-24
+
+### Movement packet audit
+
+Telemetry was added at both sides of `MID_PLAYER_UPDATE`. Idle packets are 50 bits.
+Packets carrying position are 259 bits with no camera/animation payload and 484 bits when
+those payloads are present. The server decoded the same 259-bit position vectors that the
+client encoded:
+
+```text
+FEARTX: movement=3 time=163315 changes=00 crouch=0 haspos=1 code=2
+        pos=-10392.56 -1439.93 4267.31 ...
+FEARSERVER: player update=19892 size=259 moved -2.00 0.00 0.00
+            from=-10388.55 -1439.93 4267.31 to=-10390.56 -1439.93 4267.31
+```
+
+The packet format was therefore not the cause of the reported out-of-world failure.
+
+### Model API recovery
+
+The server object snapshot now carries the authoritative model filename. Client proxies use
+that filename to load `MODL` metadata instead of relying on a guessed class mapping.
+
+Recovered record sizes and retail entry points:
+
+- model node record: 39 bytes;
+- socket record: 40 bytes;
+- node name at model `+104`, node pointer array at `+44`, node count at `+48`;
+- animation array at model `+100/+104`, animation name at animation object `+36`;
+- retail `ILTModel` vtable `0x54CC24`, `GetSocket` `0x4381E0`, `GetNode` `0x4382E0`,
+  `GetNodeName` `0x437E20`, node helper `0x42E750`, socket helper `0x42E7C0`.
+
+`CFearModel` now implements node/socket enumeration and lookup, transforms, animation
+index/name lookup, trackers, looping, time, rate, blend, weight sets and movement encoding.
+The client-only convenience methods delegate to the same implementation.
+
+Observed model metadata:
+
+```text
+player.Model00p:    nodes=61 sockets=12
+jankowski.Model00p: nodes=68 sockets=11
+Jin.Model00p:       nodes=61 sockets=14
+Rowdy_Field:        nodes=58 sockets=9
+SubMachineGun:      nodes=3  sockets=2
+```
+
+This establishes the API contract needed for character rendering. It does not yet supply
+animation keyframe poses or model submission to the renderer.
+
+### Out-of-world root cause
+
+After the Intro handoff, the client position remained at `Y=-1440`, while the server
+continued its own physics and moved to `Y=-3878`. The server eventually printed:
+
+```text
+FEARSERVER: CPlayerObj::Update - body outside of world at:
+(-11029.99,-3878.61,4290.58)
+```
+
+This was a missing authority handoff, not a serialization error. The host now exports a
+server-side player transform setter and, while the client reports that gameplay movement is
+allowed, sends the predicted position, velocity and rotation after every client update.
+The transform is not forced during cinematics.
+
+Verification after the fix:
+
+```text
+FEARPORT: serverframe=42060 srvplayer=1 pos=-10988.26 -1440.19 4267.31
+FEARPORT: movemgr inworld=1 onground=1 vel=0.00 0.00 0.00
+          pos=-10988.26 -1440.19 4267.31
+outside-of-world events: 0
+```
+
+### Frame delta
+
+`ObjectContextTimer` returned the 0.1 s clamp on most frames even though the host ran at
+roughly 120 Hz. `ILTClient::GetFrameTime()` simultaneously returned a fixed 1/60, so player
+physics, friction and UI timers used three different notions of elapsed time.
+
+The host now measures wall-clock delta with `QueryPerformanceFrequency` /
+`QueryPerformanceCounter`, clamps it to `[0.001, 0.1]`, exposes it through
+`FearHost_GetFrameDelta`, and uses it for both `GetFrameTime()` and `CMoveMgr` physics.
+Observed physics deltas were `0.0049` to `0.0075` seconds.
+
+### Sound listener ABI
+
+Frida hooks on the embedded `_RTC_CheckEsp` identified the repeated runtime-check warning
+at `CPlayerMgr::UpdatePlaying`, around `ILTClientSoundMgr::SetListener`. The Public Tools
+client calls the four-argument listener method, while `FEAR_TOOLS_CLIENT=1` installed a
+one-argument legacy vtable shim.
+
+The legacy shim is now opt-in through `FEAR_LEGACY_LISTENER_SHIM=1`. With the Public Tools
+client, the typed `CFearSoundMgr::SetListener` implementation is used and the runtime-check
+warning no longer appears.
+
+### Verified gameplay state
+
+- `W`, `S`, `A` and `D` produce client-side displacement.
+- The server follows the same transform every frame and no longer falls out of the world.
+- `Y=-1440.22` remains stable during horizontal movement.
+- Key release decays velocity to zero and position remains stationary.
+- The Intro reaches playable first-person control after about 196-207 seconds in the timed soaks.
+- The final combined soak recorded `warnings=0` and `outside=0`.
+
+Final movement samples:
+
+```text
+A: -11243.67 -1440.23 4267.31 -> -11598.71 -1440.23 4254.30
+D: -11634.51 -1440.23 4252.98 -> -11340.90 -1440.23 4263.75
+S: -11244.21 -1440.23 4267.29 -> -11235.78 -1440.23 4037.42
+```
+
+Remaining movement work is parity rather than connectivity: exact acceleration, step-up,
+slope, friction, collision hull and animation-driven view behavior still need comparison
+against retail.
+
+## Iteration 24 - Retail animation parser evidence and live model bridge
+
+Date: 2026-10-24
+
+### Retail binary dump
+
+The Steam `FEAR.exe` image decrypts its code after the Steam bootstrap completes. A
+Frida dump of the seven PE sections produced a 1,978,368-byte analysis image with SHA-256
+`173d205a369839e91eec52f3329037a37358e43eb5cd7510e50b7ea970714679`.
+
+The dump was kept under `tmp/re-engine/` and loaded into IDA. This made the model loader
+directly analyzable at virtual address `0x4325A0`; the retail `MODL` magic comparison is
+at `0x432618`. The matching implementation in the retail `EngineServer.dll` is
+`0x10023020`, with the magic comparison at `0x10023098`.
+
+### `MODL` version 33 animation record
+
+The allocation block is 21 `uint32` values. Animation records are variable-sized and use
+this layout:
+
+```text
++0x00  uint32   record prefix / keyframe-string base
++0x04  float3   user dimensions
++0x10  uint32   animation-name string offset
++0x14  uint32   interpolation time
++0x18  uint32   compression type
++0x1C  uint32   offset in animation-data blob
++0x20  uint32   reserved / observed zero
++0x24  uint32   keyframe count
++0x28  (time_ms, model-key string offset) repeated keyframe count times
+```
+
+The critical correction is that `dims` are at record `+0x04`. The earlier probe reported
+the `dims` address as the descriptor start, leaving the keyframe count four bytes late and
+placing the animation-data blob four bytes after its real start.
+
+The animation-data blob begins at:
+
+```text
+first_record_offset - allocation[0x58]
+```
+
+For `guns/models_hh/SubMachineGun.Model00p`, the first record is at `0x79D`, the blob size
+is `0x464`, and the blob therefore starts at `0x339`. For
+`chars/models/soldier_gibs_leg_left_anims.Model00p`, the corresponding values are
+`0x132 - 0x34 = 0xFE`.
+
+The small `twitch` example validates the packed rotation representation: after a 12-byte
+position prefix, five consecutive four-component `int16` rotations at `0x10A` each have a
+squared norm of `0.99997..1.00002` after division by `32767`. The retail sampler at
+`FEAR.exe+0x2EBF0` performs the same conversion and uses `0xFFFF` as the bind-pose
+sentinel.
+
+`tmp/tools/fear_modl_anim_probe.py` now reports the real record, `dims`, keyframe count,
+data-blob offset and raw bytes for each animation.
+
+### Native `ILTModel` bridge
+
+The Public Tools `GameServer.dll` already contains the complete retail-format model
+parser. The renderer facade now delegates the following reads through exported,
+read-only bridge functions:
+
+- animation name and index;
+- animation length, keyframe count, user dimensions and per-keyframe node transforms;
+- current animated node and socket transforms;
+- node and socket lookup and node count.
+
+Client proxy objects are translated to server objects through their 15-bit wire ID. The
+local player body is a separately created client model, so
+`FearClient_GetLocalPlayerBody()` supplies its identity and maps it to the authoritative
+server player model.
+
+Live values observed through the bridge:
+
+```text
+GetAnimIndex("LSt")                    -> 2
+GetAnimLength(2)                       -> 33 ms
+GetAnimLength(10)                      -> 333 ms
+GetNodeTransform(node=60, world=true)  -> success
+```
+
+Sampling `LWFR` at keyframes 0 and 12 also produced different transforms for nodes
+`47..52`; for example node `49` moved by squared distance `9422.68` and changed its
+quaternion by an L1 distance of `1.84465`. The bridge is therefore returning sampled pose
+data, not a bind-pose replacement.
+
+This replaces the previous synthetic `1000 ms` values. Animation records still created
+before the server world/player exists retain the fallback path and may generate temporary
+synthetic names; once the server model is live, lookup and playback lengths come from the
+native parser.
+
+### Verification
+
+The rebuilt host, client and server were staged together. Starting the first mission via
+`FearClient_StartNewGame()` reached gameplay state and remained responsive. The first
+post-fix soak recorded no assertion, runtime-check, pure-virtual, dialogue-timeout or
+outside-of-world event.
+
+At `sec=217.99` the client reported `moveallowed=1 cammode=0`. An injected `A` hold then
+moved the local model from `(-11167.33,-1440.27,4267.31)` to
+`(-11518.48,-1440.27,4259.32)` while the server bridge remained connected.
+
+Logs:
+
+- `run-fear-sync/anim-session3.log`
+- `run-fear-sync/anim-session4.log`
+
+The next animation work is to submit every client tracker transition to the server-side
+model when running in local compatibility mode, and then compare the animated first-person
+body, weapon and NPC poses frame-by-frame with retail.
+
+## Iteration 25 - Restore the source weapon-fire path
+
+Date: 2026-10-24
+
+### Runtime findings
+
+The v5 animation contexts use synthetic trackers 20 and 22 on the local player body. The
+v4 `ModelInstance` cannot load retail `.Model00p` files because its source loader accepts
+only the older `.ltb` container, so native client model callbacks never occur. The working
+path is to keep the GameClient tracker state in `CFearModel` and read keyframe strings from
+the authoritative Public Tools server model.
+
+`EngineServer.dll`'s `ILTModel::GetAnimKeyFrames` at `0x1002A610` confirms the runtime
+record layout used by the bridge:
+
+```text
+ModelAnim + 0x14   uint32 keyframe count
+ModelAnim + 0x18   uint32 interpolation time
+ModelAnim + 0x24   animation name string pointer
+ModelAnim + 0x28   (uint32 time_ms, char *model_key) repeated keyframe count times
+```
+
+`CF_NOTIFYMODELKEYS` had previously been written only to the v5 facade's shadow table.
+It is now forwarded to the real v4 client object as well. Native keyframe strings are
+parsed with the source `ConParse` behavior, so a record such as
+`FIRE_KEY; sound_key 10` produces two callbacks rather than a token named `FIRE_KEY;`.
+
+Two semantics in the v5 model stub were also wrong:
+
+- `SetCurAnim` must start playback; `CAnimationContext::PlayAnimation` does not call
+  `SetPlaying(true)`.
+- `ResetAnim` resets the clip time but must preserve playback state. The source
+  animation context intentionally calls it immediately after a locked animation begins.
+
+### Live result
+
+The staged first mission reached `Worlds\Release\Intro`, `GS_PLAYING`, `moveallowed=1`
+and `cammode=0`. A left click produced:
+
+```text
+FEARMODEL: set anim261 obj=00787538 tracker=22 playing=1
+FEARMODEL: keyframes obj=00787538 anim=261 native=11 keys=1
+FEARMODEL: queued anim261 key time=0 key='FIRE_KEY; sound_key 10'
+FEARBODY: fire-key tracker=22 upper=22 lower=20 enabled=1 args=1
+FEARWEAPON: fire-key state=2 enabled=1 disabled=0 visible=1
+FEARWEAPON: consume-fire clip=18 reserve=100
+FEARPORT: client message id=133 count=1
+```
+
+The authoritative state changed from `18/100` to `17/99`. A second click produced
+`16/98`, and reloading restored the clip to `18` while leaving `98` in reserve. A
+one-second forward input moved the player from
+`(-24716.58,-1446.00,11425.68)` to `(-24245.72,-1446.00,11459.72)`.
+
+For unattended runs, `FEAR_AUTO_CONFIRM=1` closes the user menu that can appear at the
+gameplay handoff. The command that opens that menu still needs to be traced and removed.
+
+Log: `run-fear-sync/weapon-session38.log`.
+
+The next gameplay task is to render the restored animated player body and weapon skeleton,
+then exercise NPC state transitions and scripted mission events against the retail reference.

@@ -91,6 +91,7 @@ LTRESULT CRenderTargetMgr::RemoveRenderTarget(HRENDERTARGET hRenderTarget)
 		if(iter->second)
 		{
 			delete iter->second;
+			m_RenderTargets.erase(iter);
 			return LT_OK;
 		}
 		else

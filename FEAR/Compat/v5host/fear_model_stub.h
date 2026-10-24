@@ -81,4 +81,12 @@ public:
 
 extern CFearModel g_FearModel;
 
+typedef void (*TFearModelKeySink)(HOBJECT hObject, uint32 nTracker, const char *pszKey);
+
+void FearModel_SetKeySink(TFearModelKeySink pSink);
+void FearModel_TickAnimationKeys(float fDelta);
+void FearModel_SetObjectFilename(HOBJECT hObject, const char *pszFilename);
+const char *FearModel_GetObjectFilename(HOBJECT hObject);
+void FearModel_RemoveObject(HOBJECT hObject);
+
 #endif

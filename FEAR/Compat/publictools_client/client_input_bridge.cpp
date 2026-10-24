@@ -4,6 +4,7 @@
 #include "MissionMgr.h"
 #include "ClientConnectionMgr.h"
 #include "PlayerMgr.h"
+#include "PlayerBodyMgr.h"
 #include "PlayerCamera.h"
 #include "SFXMgr.h"
 #include "CharacterFX.h"
@@ -15,6 +16,14 @@
 #include "CMoveMgr.h"
 #include "BindMgr.h"
 #include "CommandIDs.h"
+#include "DamageFXMgr.h"
+#include "LadderMgr.h"
+#include "SpecialMoveMgr.h"
+#include "VehicleMgr.h"
+#include "ClientWeaponMgr.h"
+#include "ClientWeapon.h"
+#include "PlayerStats.h"
+#include "HUDMgr.h"
 
 extern void UnhookWindow();
 
@@ -30,6 +39,11 @@ extern "C" __declspec(dllexport) int FearClient_StartNewGame()
     return g_pMissionMgr->StartGameNew() ? 1 : 0;
 }
 
+extern "C" __declspec(dllexport) void *FearClient_GetLocalPlayerBody()
+{
+    return CPlayerBodyMgr::Instance().GetObject();
+}
+
 extern "C" __declspec(dllexport) void FearClient_PreLoadWorld(const char *pszWorldName)
 {
     if (g_pMissionMgr && pszWorldName)
@@ -40,6 +54,19 @@ extern "C" __declspec(dllexport) void FearClient_OnEnterWorld()
 {
     if (g_pGameClientShell)
         g_pGameClientShell->OnEnterWorld();
+
+    if (g_pMissionMgr && getenv("FEAR_LOCAL_CLIENT"))
+    {
+        CAutoMessage cMsg;
+        cMsg.Writeuint8(EServerGameState_Playing);
+        CLTMsgRef_Read cRead = cMsg.Read();
+        if (cRead)
+        {
+            printf("FEARPORT: local client server-state Playing\n");
+            fflush(stdout);
+            g_pMissionMgr->OnMessage(MID_SERVERGAMESTATE, *cRead);
+        }
+    }
 }
 
 extern "C" __declspec(dllexport) void FearClient_EnterWorldPreview()
@@ -80,6 +107,117 @@ extern "C" __declspec(dllexport) int FearClient_IsPlaying()
     return (g_pInterfaceMgr && g_pInterfaceMgr->GetGameState() == GS_PLAYING) ? 1 : 0;
 }
 
+extern "C" __declspec(dllexport) int FearClient_GetGameState()
+{
+    return g_pInterfaceMgr ? (int)g_pInterfaceMgr->GetGameState() : -1;
+}
+
+extern "C" __declspec(dllexport) void FearClient_CloseUserMenu()
+{
+    if (g_pInterfaceMgr)
+        g_pInterfaceMgr->GetUserMenuMgr().Close();
+}
+
+extern "C" __declspec(dllexport) void *FearClient_GetMoveObject()
+{
+    if (!g_pPlayerMgr)
+        return NULL;
+
+    CMoveMgr *pMoveMgr = g_pPlayerMgr->GetMoveMgr();
+    return pMoveMgr ? (void *)pMoveMgr->GetObject() : NULL;
+}
+
+extern "C" __declspec(dllexport) int FearClient_IsPlayerMovementAllowed()
+{
+    if (!g_pPlayerMgr || !g_pInterfaceMgr)
+        return 0;
+    return g_pPlayerMgr->IsPlayerMovementAllowed() &&
+        g_pInterfaceMgr->AllowCameraMovement() ? 1 : 0;
+}
+
+extern "C" __declspec(dllexport) int FearClient_GetMovementState(
+    float *pPosition, float *pVelocity, float *pRotation)
+{
+    if (!g_pPlayerMgr || !g_pLTClient || !pPosition || !pVelocity || !pRotation)
+        return 0;
+
+    CMoveMgr *pMoveMgr = g_pPlayerMgr->GetMoveMgr();
+    if (!pMoveMgr)
+        return 0;
+
+    HOBJECT hObject = pMoveMgr->GetObject();
+    if (!hObject)
+        return 0;
+
+    LTVector vPosition;
+    LTRotation rRotation;
+    if (g_pLTClient->GetObjectPos(hObject, &vPosition) != LT_OK ||
+        g_pLTClient->GetObjectRotation(hObject, &rRotation) != LT_OK)
+        return 0;
+
+    LTVector vVelocity = pMoveMgr->GetVelocity();
+    pPosition[0] = vPosition.x;
+    pPosition[1] = vPosition.y;
+    pPosition[2] = vPosition.z;
+    pVelocity[0] = vVelocity.x;
+    pVelocity[1] = vVelocity.y;
+    pVelocity[2] = vVelocity.z;
+    for (int i = 0; i < 4; ++i)
+        pRotation[i] = rRotation.m_Quat[i];
+    return 1;
+}
+
+extern "C" __declspec(dllexport) void FearClient_ApplyServerCamera(
+    void *pServerObject,
+    unsigned int nFlags,
+    unsigned int nFlags2,
+    unsigned int nUserFlags,
+    const float *pPosition,
+    const float *pRotation,
+    const unsigned char *pSFXData,
+    unsigned int nSFXBits,
+    int bNotify)
+{
+    HOBJECT hObject = (HOBJECT)pServerObject;
+    if (!hObject || !g_pLTClient || !g_pCommonLT)
+        return;
+
+    if (pPosition)
+    {
+        LTVector vPosition(pPosition[0], pPosition[1], pPosition[2]);
+        g_pLTClient->SetObjectPos(hObject, vPosition);
+    }
+    if (pRotation)
+    {
+        LTRotation rRotation;
+        rRotation.m_Quat[0] = pRotation[0];
+        rRotation.m_Quat[1] = pRotation[1];
+        rRotation.m_Quat[2] = pRotation[2];
+        rRotation.m_Quat[3] = pRotation[3];
+        g_pLTClient->SetObjectRotation(hObject, rRotation);
+    }
+
+    g_pCommonLT->SetObjectFlags(hObject, OFT_Flags, nFlags, 0xFFFFFFFFu);
+    g_pCommonLT->SetObjectFlags(hObject, OFT_Flags2, nFlags2, 0xFFFFFFFFu);
+    g_pCommonLT->SetObjectFlags(hObject, OFT_User, nUserFlags, 0xFFFFFFFFu);
+
+    if (bNotify && pSFXData && nSFXBits && g_pGameClientShell)
+    {
+        CAutoMessage cMsg;
+        cMsg.WriteData(pSFXData, nSFXBits);
+        g_pGameClientShell->SpecialEffectNotify(hObject, cMsg.Read());
+
+        CSFXMgr *pSFXMgr = g_pGameClientShell->GetSFXMgr();
+        if (pSFXMgr && pSFXData[0] == SFX_CHARACTER_ID)
+        {
+            CCharacterFX *pCharacterFX = pSFXMgr->GetCharacterFX(hObject);
+            printf("FEARPORT: authoritative character sfx object=%p fx=%p bits=%u\n",
+                (void *)hObject, (void *)pCharacterFX, nSFXBits);
+            fflush(stdout);
+        }
+    }
+}
+
 extern "C" __declspec(dllexport) int FearClient_PreparePortPlayer(void *hTarget)
 {
     if (!g_pPlayerMgr || !hTarget)
@@ -97,16 +235,15 @@ extern "C" __declspec(dllexport) int FearClient_PreparePortPlayer(void *hTarget)
 
 static HOBJECT g_hLocalCharacter = NULL;
 
-extern "C" __declspec(dllexport) int FearClient_CreateLocalCharacter(void *hObject)
+static int FearClientCreateCharacterFX(HOBJECT hServerObj, bool bInitializeLocalPlayer)
 {
-    if (!g_pGameClientShell || !hObject)
+    if (!g_pGameClientShell || !hServerObj)
         return 0;
 
     CSFXMgr *pSFXMgr = g_pGameClientShell->GetSFXMgr();
     if (!pSFXMgr)
         return 0;
 
-    HOBJECT hServerObj = (HOBJECT)hObject;
     if (pSFXMgr->GetCharacterFX(hServerObj))
         return 1;
 
@@ -119,20 +256,47 @@ extern "C" __declspec(dllexport) int FearClient_CreateLocalCharacter(void *hObje
 
     charCreate.hModel = g_pModelsDB ? g_pModelsDB->GetModelByRecordName(DEFAULT_PLAYERNAME) : NULL;
 
-    printf("FEARPORT: local character modelsdb=%p model=%p\n", (void *)g_pModelsDB, (void *)charCreate.hModel);
+    printf("FEARPORT: character modelsdb=%p model=%p local=%d\n",
+        (void *)g_pModelsDB, (void *)charCreate.hModel, bInitializeLocalPlayer ? 1 : 0);
     fflush(stdout);
 
     if (!pSFXMgr->CreateSFX(SFX_CHARACTER_ID, &charCreate))
     {
-        printf("FEARPORT: local character fx creation failed\n");
+        printf("FEARPORT: character fx creation failed for %p\n", (void *)hServerObj);
         fflush(stdout);
         return 0;
     }
 
-    printf("FEARPORT: local character fx created for %p\n", hObject);
+    CCharacterFX *pCharacterFX = pSFXMgr->GetCharacterFX(hServerObj);
+    if (pCharacterFX && bInitializeLocalPlayer && g_pPlayerMgr)
+        g_pPlayerMgr->InitLocalPlayer(*pCharacterFX);
+
+    printf("FEARPORT: character fx created for %p initlocal=%d result=%d\n",
+        (void *)hServerObj, bInitializeLocalPlayer ? 1 : 0, pCharacterFX ? 1 : 0);
     fflush(stdout);
-    g_hLocalCharacter = hServerObj;
+    if (bInitializeLocalPlayer)
+        g_hLocalCharacter = hServerObj;
     return 1;
+}
+
+extern "C" __declspec(dllexport) int FearClient_CreateLocalCharacter(void *hObject)
+{
+    return FearClientCreateCharacterFX((HOBJECT)hObject, true);
+}
+
+extern "C" __declspec(dllexport) int FearClient_EnsureDialogueCharacter(void *hObject)
+{
+    return FearClientCreateCharacterFX((HOBJECT)hObject, false);
+}
+
+extern "C" __declspec(dllexport) void FearClient_ResetObjectFX(void *hObject)
+{
+    if (!g_pGameClientShell || !hObject)
+        return;
+
+    CSFXMgr *pSFXMgr = g_pGameClientShell->GetSFXMgr();
+    if (pSFXMgr)
+        pSFXMgr->RemoveSpecialFX((HOBJECT)hObject);
 }
 
 extern "C" __declspec(dllexport) void FearClient_RenderPortCamera()
@@ -153,6 +317,9 @@ extern "C" __declspec(dllexport) void FearClient_RenderPortCamera()
     if (g_pInterfaceMgr && g_pInterfaceMgr->IsInGame())
         g_pInterfaceMgr->Draw();
 
+    pRenderer->End3D();
+    pRenderer->FlipScreen();
+
     static int s_nPortFrame = 0;
     ++s_nPortFrame;
     const char *pszCapturePath = getenv("FEAR_CAPTURE_PATH");
@@ -167,24 +334,32 @@ extern "C" __declspec(dllexport) void FearClient_RenderPortCamera()
 
         const char *pszEvery = getenv("FEAR_CAPTURE_EVERY");
         const int nEvery = pszEvery && pszEvery[0] ? atoi(pszEvery) : 0;
+        const char *pszLimit = getenv("FEAR_CAPTURE_LIMIT");
+        static int s_nCaptureCount = 0;
+        const int nLimit = pszLimit && pszLimit[0] ? atoi(pszLimit) : 0;
         if (nEvery > 0)
         {
-            if (s_nPortFrame >= s_nCaptureFrame && ((s_nPortFrame - s_nCaptureFrame) % nEvery) == 0)
+            if ((nLimit <= 0 || s_nCaptureCount < nLimit) &&
+                s_nPortFrame >= s_nCaptureFrame &&
+                ((s_nPortFrame - s_nCaptureFrame) % nEvery) == 0)
             {
                 char szSeq[512];
                 _snprintf(szSeq, sizeof(szSeq), "%s_%04d.bmp", pszCapturePath, s_nPortFrame);
                 szSeq[sizeof(szSeq) - 1] = 0;
+                printf("FEARPORT: capture frame=%d file='%s'\n", s_nPortFrame, szSeq);
+                fflush(stdout);
                 pRenderer->MakeScreenShot(szSeq);
+                ++s_nCaptureCount;
             }
         }
-        else if (s_nPortFrame == s_nCaptureFrame)
+        else if (s_nPortFrame == s_nCaptureFrame && s_nCaptureCount == 0)
         {
+            printf("FEARPORT: capture frame=%d file='%s'\n", s_nPortFrame, pszCapturePath);
+            fflush(stdout);
             pRenderer->MakeScreenShot(pszCapturePath);
+            ++s_nCaptureCount;
         }
     }
-
-    pRenderer->End3D();
-    pRenderer->FlipScreen();
 }
 
 extern "C" __declspec(dllexport) void FearClient_LogState()
@@ -194,8 +369,37 @@ extern "C" __declspec(dllexport) void FearClient_LogState()
     int nSentState = g_pClientConnectionMgr ? (int)g_pClientConnectionMgr->GetSentClientConnectionState() : -1;
     int nPlayerState = g_pPlayerMgr ? (int)g_pPlayerMgr->GetPlayerState() : -1;
     const char *pszWorld = g_pMissionMgr ? g_pMissionMgr->GetCurrentWorldName() : "";
-    printf("FEARPORT: clientstate game=%d recv=%d sent=%d player=%d world='%s'\n",
-        nGameState, nRecvState, nSentState, nPlayerState, pszWorld ? pszWorld : "");
+    printf("FEARPORT: clientstate game=%d servergame=%d recv=%d sent=%d player=%d world='%s'\n",
+        nGameState,
+        g_pMissionMgr ? (int)g_pMissionMgr->GetServerGameState() : -1,
+        nRecvState,
+        nSentState,
+        nPlayerState,
+        pszWorld ? pszWorld : "");
+
+    int nHudLevel = -1;
+    int nHudVisible = -1;
+    int nStoryMode = -1;
+    if (g_pInterfaceMgr && g_pInterfaceMgr->GetHUDMgr())
+    {
+        nHudLevel = (int)g_pInterfaceMgr->GetHUDMgr()->GetRenderLevel();
+        nHudVisible = g_pInterfaceMgr->GetHUDMgr()->IsShown() ? 1 : 0;
+    }
+    if (g_pPlayerMgr)
+        nStoryMode = g_pPlayerMgr->InStoryMode() ? 1 : 0;
+
+    static int s_nLastHudLevel = -2;
+    static int s_nLastHudVisible = -2;
+    static int s_nLastStoryMode = -2;
+    if (nHudLevel != s_nLastHudLevel || nHudVisible != s_nLastHudVisible ||
+        nStoryMode != s_nLastStoryMode)
+    {
+        s_nLastHudLevel = nHudLevel;
+        s_nLastHudVisible = nHudVisible;
+        s_nLastStoryMode = nStoryMode;
+        printf("FEARPORT: hud level=%d visible=%d story=%d\n",
+            nHudLevel, nHudVisible, nStoryMode);
+    }
 
     if (g_pLTClient)
     {
@@ -264,6 +468,26 @@ extern "C" __declspec(dllexport) void FearClient_MouseButton(int nButton, int nD
 {
     if (!g_pInterfaceMgr)
         return;
+
+    if (g_pPlayerMgr && g_pInterfaceMgr->GetGameState() == GS_PLAYING &&
+        (nButton == 0 || nButton == 1))
+    {
+        const int nCommand = (nButton == 0) ? COMMAND_ID_FIRING : COMMAND_ID_ALT_FIRING;
+        bool bHandled = false;
+        if (nDown)
+            bHandled = g_pPlayerMgr->OnCommandOn(nCommand);
+        else
+            bHandled = g_pPlayerMgr->OnCommandOff(nCommand);
+        printf("FEARPORT: mouse command=%d down=%d handled=%d flags=%08x canfire=%d state=%d damageallow=%d\n",
+            nCommand,
+            nDown ? 1 : 0,
+            bHandled ? 1 : 0,
+            g_pPlayerMgr->GetPlayerFlags(),
+            g_pPlayerMgr->CanFireWeapon() ? 1 : 0,
+            g_pClientWeaponMgr ? (int)g_pClientWeaponMgr->GetCurrentWeaponState() : -1,
+            g_pDamageFXMgr && g_pDamageFXMgr->AllowWeapons() ? 1 : 0);
+        fflush(stdout);
+    }
 
     if (nButton == 0)
     {
@@ -371,6 +595,10 @@ extern "C" __declspec(dllexport) void FearClient_LogInputState()
     CBindMgr::TBindingList aForward;
     cBindMgr.GetCommandBindings(COMMAND_ID_FORWARD, &aForward);
 
+    printf("FEARPORT: gatestate cameramove=%d mp=%d allowinput=%d\n",
+        (g_pInterfaceMgr && g_pInterfaceMgr->AllowCameraMovement()) ? 1 : 0,
+        IsMultiplayerGameClient() ? 1 : 0,
+        (g_pPlayerMgr && g_pPlayerMgr->IsPlayerMovementAllowed()) ? 1 : 0);
     printf("FEARPORT: input bindings=%u forward=%d yaw=%.3f pitch=%.3f wdown=%d\n",
         (unsigned)aForward.size(),
         cBindMgr.IsCommandOn(COMMAND_ID_FORWARD) ? 1 : 0,
@@ -384,8 +612,12 @@ extern "C" __declspec(dllexport) void FearClient_LogInputState()
         LTVector vVel = pMoveMgr->GetVelocity();
         HOBJECT hMoveObj = pMoveMgr->GetObject();
         LTVector vPos(0.0f, 0.0f, 0.0f);
+        LTVector vAccel(0.0f, 0.0f, 0.0f);
         if (hMoveObj && g_pLTClient)
+        {
             g_pLTClient->GetObjectPos(hMoveObj, &vPos);
+            g_pPhysicsLT->GetAcceleration(hMoveObj, &vAccel);
+        }
         printf("FEARPORT: movemgr obj=%p inworld=%d onground=%d vel=%.2f %.2f %.2f pos=%.2f %.2f %.2f allowed=%d dead=%d\n",
             hMoveObj,
             pMoveMgr->IsInWorld() ? 1 : 0,
@@ -394,6 +626,21 @@ extern "C" __declspec(dllexport) void FearClient_LogInputState()
             vPos.x, vPos.y, vPos.z,
             g_pPlayerMgr->IsPlayerMovementAllowed() ? 1 : 0,
             g_pPlayerMgr->IsPlayerDead() ? 1 : 0);
+        printf("FEARPORT: movegate allow=%d damage=%d flags=%08x accel=%.2f %.2f %.2f\n",
+            pMoveMgr->GetAllowMovement() ? 1 : 0,
+            g_pDamageFXMgr->AllowMovement() ? 1 : 0,
+            pMoveMgr->GetControlFlags(),
+            vAccel.x, vAccel.y, vAccel.z);
+        printf("FEARPORT: movehold physics=%d node=%p ladder=%d special=%d turret=%d vehicle=%d cam=%d allowcam=%d spectator=%d\n",
+            (int)pMoveMgr->GetVehicleMgr()->GetPhysicsModel(),
+            (void *)g_pPlayerMgr->GetPlayerNodeGoto(),
+            LadderMgr::Instance().IsClimbing() ? 1 : 0,
+            SpecialMoveMgr::Instance().IsActive() ? 1 : 0,
+            g_pPlayerMgr->IsOperatingTurret() ? 1 : 0,
+            pMoveMgr->GetVehicleMgr()->IsVehiclePhysics() ? 1 : 0,
+            g_pPlayerMgr->GetPlayerCamera() ? (int)g_pPlayerMgr->GetPlayerCamera()->GetCameraMode() : -1,
+            g_pInterfaceMgr->AllowCameraMovement() ? 1 : 0,
+            (int)g_pPlayerMgr->GetSpectatorMode());
     }
     else
     {
@@ -413,6 +660,64 @@ extern "C" __declspec(dllexport) void FearClient_LogInputState()
             (int)g_pPlayerMgr->GetPlayerState(),
             g_pPlayerMgr->IsPlayerInWorld() ? 1 : 0,
             g_pInterfaceMgr ? (int)g_pInterfaceMgr->GetGameState() : -1);
+    }
+    fflush(stdout);
+}
+
+extern "C" __declspec(dllexport) void FearClient_LogWeaponState()
+{
+    CClientWeapon *pWeapon =
+        g_pClientWeaponMgr ? g_pClientWeaponMgr->GetCurrentClientWeapon() : NULL;
+    HWEAPON hWeapon = pWeapon ? pWeapon->GetWeaponRecord() : NULL;
+    HAMMO hAmmo = pWeapon ? pWeapon->GetAmmoRecord() : NULL;
+    const char *pszWeapon =
+        (g_pLTDatabase && hWeapon) ? g_pLTDatabase->GetRecordName(hWeapon) : "";
+    const char *pszAmmo =
+        (g_pLTDatabase && hAmmo) ? g_pLTDatabase->GetRecordName(hAmmo) : "";
+    HWEAPON hStatsWeapon = g_pPlayerStats ? g_pPlayerStats->GetCurrentWeaponRecord() : NULL;
+    HAMMO hStatsAmmo = g_pPlayerStats ? g_pPlayerStats->GetCurrentAmmoRecord() : NULL;
+    const char *pszStatsWeapon =
+        (g_pLTDatabase && hStatsWeapon) ? g_pLTDatabase->GetRecordName(hStatsWeapon) : "";
+    const char *pszStatsAmmo =
+        (g_pLTDatabase && hStatsAmmo) ? g_pLTDatabase->GetRecordName(hStatsAmmo) : "";
+    HWEAPON hPistol = g_pWeaponDB ? g_pWeaponDB->GetWeaponRecord("Pistol") : NULL;
+    const bool bHavePistol = g_pPlayerStats && hPistol && g_pPlayerStats->HaveWeapon(hPistol);
+    const bool bCanPistol =
+        hPistol && g_pClientWeaponMgr && g_pClientWeaponMgr->CanChangeToWeapon(hPistol);
+
+    printf("FEARWEAPON: stats=%p mgr=%p current=%p weapon=%p name='%s' ammo=%p ammo_name='%s' clip=%d reserve=%u firing=%d\n",
+        (void *)g_pPlayerStats,
+        (void *)g_pClientWeaponMgr,
+        (void *)pWeapon,
+        (void *)hWeapon,
+        pszWeapon ? pszWeapon : "",
+        (void *)hAmmo,
+        pszAmmo ? pszAmmo : "",
+        pWeapon ? pWeapon->GetAmmoInClips() : -1,
+        (g_pPlayerStats && hAmmo) ? g_pPlayerStats->GetAmmoCount(hAmmo) : 0,
+        CBindMgr::GetSingleton().IsCommandOn(COMMAND_ID_FIRING) ? 1 : 0);
+    if (g_pPlayerStats)
+    {
+        printf("FEARSTATS: health=%u/%u armor=%u/%u weapons=%u air=%.3f\n",
+            g_pPlayerStats->GetHealth(),
+            g_pPlayerStats->GetMaxHealth(),
+            g_pPlayerStats->GetArmor(),
+            g_pPlayerStats->GetMaxArmor(),
+            g_pPlayerStats->GetNumHaveWeapons(),
+            g_pPlayerStats->GetAirPercent());
+        printf("FEARAMMO: current_weapon=%p name='%s' current_ammo=%p name='%s' count=%u\n",
+            (void *)hStatsWeapon,
+            pszStatsWeapon ? pszStatsWeapon : "",
+            (void *)hStatsAmmo,
+            pszStatsAmmo ? pszStatsAmmo : "",
+            g_pPlayerStats->GetCurrentAmmoCount());
+        printf("FEARPISTOL: record=%p have=%d can=%d special=%d enabled=%d visible=%d\n",
+            (void *)hPistol,
+            bHavePistol ? 1 : 0,
+            bCanPistol ? 1 : 0,
+            CPlayerBodyMgr::Instance().IsPlayingSpecial() ? 1 : 0,
+            g_pClientWeaponMgr && g_pClientWeaponMgr->WeaponsEnabled() ? 1 : 0,
+            g_pClientWeaponMgr && g_pClientWeaponMgr->WeaponsVisible() ? 1 : 0);
     }
     fflush(stdout);
 }

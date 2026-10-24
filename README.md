@@ -21,15 +21,18 @@ The project has reached the first-mission startup milestone:
   `Worlds\Release\Intro`;
 - the client and server now exchange the real connection, start-level, player-state and
   InWorld messages;
-- the client reaches `GS_PLAYING` with a live server-side player in `Worlds\Release\Intro`.
+- the client reaches `GS_PLAYING` with a live server-side player in `Worlds\Release\Intro`;
+- first-person movement runs with a measured frame delta and the authoritative server player
+  follows the client transform every frame.
 
 This is a startup milestone, not a finished playable mission. The player camera is now attached
 to the server player and renders the v113 world through the v5 renderer callback; the interface
 manager also draws the HUD. The world is batched by material and 455 `.Mat00` textures are
-decoded and uploaded from the staged archives. Object replication, local-player movement,
-weapons, models, lightmaps, `.fxo` shaders, shadows and the remaining HUD state are still not
-restored. The object-dependent messages are filtered until the v5 database records and server
-object handles are mapped to the client.
+decoded and uploaded from the staged archives. Object replication and local-player movement are
+active. Character animation now uses the native server `ILTModel` parser and sampler through the
+compatibility bridge; skeletal mesh submission, weapons, lightmaps, `.fxo` shaders, shadows and
+the remaining HUD state are still incomplete. Collision currently uses the host engine's world
+intersection and still needs parity validation against the original player controller.
 
 | Area | Current state |
 |---|---|
@@ -39,9 +42,9 @@ object handles are mapped to the client.
 | First mission startup | `GS_PLAYING`, player Alive, `Worlds\Release\Intro` |
 | Player camera | Wired to the server player transform |
 | Camera projection | Uses the client's `SetCameraFOV` values (91.3° x 75.0° at 1024x768) |
-| Local player character | Character FX created, `MODL` data still stubbed |
-| Playable movement / collision | Not yet |
-| HUD / weapons | HUD draws; weapons and player values incomplete |
+| Local player character | Character FX created; native animation lengths, keyframes, node poses and sockets available; skeletal draw path incomplete |
+| Playable movement / collision | Stable first-person movement with client/server position sync; collision parity pending |
+| HUD / weapons | HUD draws; pistol fire animation/model keys and server ammo replication work; view-model rendering incomplete |
 | v113 renderer | Table-driven vertex decoding, `CCW` culling, 1988/1988 world objects parsed; lightmaps and shadows missing |
 | 95% visual parity | Not yet measured or reached |
 | Parity measurement | `tools/parity_check.py` (SSIM, CIEDE2000, channel tolerance) |
@@ -54,19 +57,21 @@ Lithtech.exe (v4)
   └─ CShell.dll
       └─ FearHost.dll
           ├─ GameClient.dll        source-built v5 client
-          ├─ GameServer.dll        retail v5 server game code
+          ├─ GameServer.dll        Public Tools 1.08 server game code built from source
           └─ EngineServer.dll      retail v5 server engine
 ```
 
 The two generations are deliberately separated: the v4 engine owns the host and the source
-client, while the retail v5 server stays in its native MSVC 7.1 world. The bridge uses only
-interfaces with POD/handle arguments and raw messages. This keeps the v5 renderer path open
-without pretending that the v4 and v5 engine databases and object layouts are interchangeable.
+client, while the v5 server engine and Public Tools server code stay in their native MSVC 7.1
+world. The bridge uses only interfaces with POD/handle arguments and raw messages. This keeps
+the v5 renderer path open without pretending that the v4 and v5 engine databases and object
+layouts are interchangeable.
 
-The retail `EngineServer.dll` and `GameServer.dll` are currently a bootstrap for reaching the
-first mission. They are not the final source-only server. Internal offsets and the
-`IsMultiplayerExe` patch are isolated in `FEAR/Compat/v5host/fear_server_host.cpp` and must be
-replaced by a source-side `IServerShell`/`ILTServer` implementation.
+The retail `EngineServer.dll` and source-built Public Tools `GameServer.dll` are currently a
+bootstrap for reaching the first mission. They are not the final source-only server. Internal
+offsets and the `IsMultiplayerExe` patch are isolated in
+`FEAR/Compat/v5host/fear_server_host.cpp` and must be replaced by a source-side
+`IServerShell`/`ILTServer` implementation.
 
 ## Reverse engineering
 
@@ -106,6 +111,13 @@ Build the source `GameClient.dll` against the Public Tools SDK:
   -PublicToolsDir "D:\SteamLibrary\steamapps\common\FEAR Ultimate Shooter Edition\FEAR Public Tools 1.08"
 ```
 
+Build the matching server game module:
+
+```powershell
+.\tools\build_fear_server.ps1 `
+  -PublicToolsDir "D:\SteamLibrary\steamapps\common\FEAR Ultimate Shooter Edition\FEAR Public Tools 1.08"
+```
+
 The F.E.A.R. port is an isolated CMake configuration (`BUILD_FEAR_PORT=ON`) and writes its
 artifacts to `build-fear/OUT_FEAR`. See `BUILD_WINDOWS.md` for toolchain, DirectX SDK and SDL2
 requirements.
@@ -117,7 +129,8 @@ Stage a writable run directory from the retail installation:
 ```powershell
 .\tools\run_fear_port.ps1 `
   -RetailDir "D:\SteamLibrary\steamapps\common\FEAR Ultimate Shooter Edition" `
-  -GameClientDll "build-fear-client\GameClient.dll"
+  -GameClientDll "build-fear-client\GameClient.dll" `
+  -GameServerDll "build-fear-server\GameServer.dll"
 ```
 
 For deterministic startup tests, set `FEAR_AUTOSTART=1`; this drives `StartGameNew` without
@@ -151,12 +164,12 @@ and is not part of the repository or the final runtime.
    property count, a blob and four payload bytes per property. The C++ parser reads all 1988 objects
    in `Intro.World00p` and recovers 35 point, 12 spot, 2 directional and 39 cube lights plus
    `AmbientLight=(25,25,25)`. The missing term is the material lightmap stage, not the light list.
-3. Port the MODL 33 model loader, animation and HUD services, using the retail renderer as the
-   reference. This also clears the `no Null weightset on Character` error.
+3. Finish the MODL 33 skeletal draw path using the decoded 40-byte animation record and native
+   `ILTModel` animation bridge, then compare character and weapon poses with retail.
 4. Restore `.fxo` shaders, fog, shadow volumes and post-processing on top of the material and DDS
    texture path that already works.
-5. Map the v5 database records and server object handles to client-side objects, then remove the
-   safe-message filter and finish movement, collisions, weapons and HUD values.
+5. Render the animated player body and view model from the original MODL skeleton, then validate
+   weapon FX, HUD values, collision and animation-driven camera behavior against the retail controller.
 6. Replace the retail server bootstrap with a source-side v5 server.
 
 ## Provenance

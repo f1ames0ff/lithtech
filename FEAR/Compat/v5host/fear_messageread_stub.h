@@ -11,7 +11,10 @@ public:
     declare_interface(CFearMessageRead)
     CFearMessageRead() = default;
     ~CFearMessageRead() {}
-    void Free() override {}
+    void AddRef() override;
+    void Release() override;
+    void StaticRelease() override;
+    void Free() override;
     void SetData(const uint8 *pData, uint32 nBits);
 
     ILTMessage_Read * Clone() const override;
@@ -55,8 +58,9 @@ private:
     uint32 m_nDataBits = 0;
     uint32 m_nReadPos = 0;
     std::vector<uint8> m_Storage;
+    int m_nRefs = 0;
 };
 
-extern CFearMessageRead g_FearMessageRead;
+
 
 #endif

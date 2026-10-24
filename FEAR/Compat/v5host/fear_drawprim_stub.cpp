@@ -1,4 +1,5 @@
 #include "fear_drawprim_stub.h"
+#include "fear_renderer_stub.h"
 #include "fear_render_api.h"
 #include "fear_host_api.h"
 #include <stdio.h>
@@ -238,12 +239,57 @@ LTRESULT CFearDrawPrim::EndDrawPrimMaterialBlock()
 
 LTRESULT CFearDrawPrim::DrawPrimMaterial(LT_POLYGTTS4 *pPrim, const uint32 nCount, HMATERIAL hMaterial)
 {
-    FEAR_UNIMPL_LOG("ILTDrawPrim::DrawPrimMaterial(POLYGTTS4)");
-    return LT_UNSUPPORTED;
+    FEAR_FWD_LOG("ILTDrawPrim::DrawPrimMaterial(POLYGTTS4)");
+    if (!pPrim || !hMaterial)
+        return LT_INVALIDPARAMS;
+    const FearRenderApi *pRender = FearRender();
+    if (!pRender)
+        return LT_UNSUPPORTED;
+    void *pTexture = FearRenderer_GetMaterialTexture(hMaterial);
+
+    for (uint32 i = 0; i < nCount; ++i)
+    {
+        float xy[8];
+        float uv[8];
+        for (int k = 0; k < 4; ++k)
+        {
+            xy[k * 2] = pPrim[i].verts[k].pos.x;
+            xy[k * 2 + 1] = pPrim[i].verts[k].pos.y;
+            uv[k * 2] = pPrim[i].verts[k].uv.x;
+            uv[k * 2 + 1] = pPrim[i].verts[k].uv.y;
+        }
+        if (!pRender->DrawQuad2D(
+            xy, uv, pPrim[i].verts[0].rgba.m_nColor, pTexture))
+            return LT_ERROR;
+    }
+    return LT_OK;
 }
 
 LTRESULT CFearDrawPrim::DrawPrimMaterial(LT_POLYGTTS3 *pPrim, const uint32 nCount, HMATERIAL hMaterial)
 {
-    FEAR_UNIMPL_LOG("ILTDrawPrim::DrawPrimMaterial(POLYGTTS3)");
-    return LT_UNSUPPORTED;
+    FEAR_FWD_LOG("ILTDrawPrim::DrawPrimMaterial(POLYGTTS3)");
+    if (!pPrim || !hMaterial)
+        return LT_INVALIDPARAMS;
+    const FearRenderApi *pRender = FearRender();
+    if (!pRender)
+        return LT_UNSUPPORTED;
+    void *pTexture = FearRenderer_GetMaterialTexture(hMaterial);
+
+    for (uint32 i = 0; i < nCount; ++i)
+    {
+        float xy[8];
+        float uv[8];
+        for (int k = 0; k < 4; ++k)
+        {
+            const LT_VERTGTTS &vertex = pPrim[i].verts[k < 3 ? k : 2];
+            xy[k * 2] = vertex.pos.x;
+            xy[k * 2 + 1] = vertex.pos.y;
+            uv[k * 2] = vertex.uv.x;
+            uv[k * 2 + 1] = vertex.uv.y;
+        }
+        if (!pRender->DrawQuad2D(
+            xy, uv, pPrim[i].verts[0].rgba.m_nColor, pTexture))
+            return LT_ERROR;
+    }
+    return LT_OK;
 }

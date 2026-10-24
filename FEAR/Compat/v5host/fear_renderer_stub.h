@@ -4,6 +4,8 @@
 #include "ltbasedefs.h"
 #include "iltrenderer.h"
 
+extern "C" void *FearRenderer_GetMaterialTexture(HMATERIAL hMaterial);
+
 class CFearRenderer : public ILTRenderer
 {
 public:

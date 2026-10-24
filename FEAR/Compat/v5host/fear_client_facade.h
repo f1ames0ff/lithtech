@@ -135,4 +135,9 @@ public:
     bool IsMultiplayerExe() override;
 };
 
+int FearClient_GetMappedObjectCount();
+bool FearClient_GetClientModelInfo(
+    int nIndex, HOBJECT *phObject, char *pszFilename, unsigned int nFilenameLength,
+    float *pPosition, float *pRotation);
+
 #endif

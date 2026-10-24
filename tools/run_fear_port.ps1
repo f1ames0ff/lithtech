@@ -5,12 +5,20 @@ param(
     [string]$Stage = "",
     [string]$GameClientDir = "",
     [string]$GameClientDll = "",
+    [string]$GameServerDll = "",
+    [int]$ScreenWidth = 1920,
+    [int]$ScreenHeight = 1080,
     [switch]$NoRun
 )
 
 $ErrorActionPreference = "Stop"
 
 $repoRoot = Split-Path -Parent $PSScriptRoot
+
+if ($ScreenWidth -lt 320 -or $ScreenHeight -lt 240)
+{
+    throw "Screen resolution is too small: ${ScreenWidth}x${ScreenHeight}"
+}
 
 function Get-FullPath([string]$Path, [string]$BaseDir) {
     if ([System.IO.Path]::IsPathRooted($Path)) {
@@ -279,11 +287,27 @@ foreach ($relative in $archiveRuntimeFiles) {
     Write-Host "Extracted $relative from $(Split-Path -Leaf $owner)"
 }
 
+if ($GameServerDll) {
+    $source = Get-FullPath $GameServerDll $repoRoot
+    if (-not (Test-Path -LiteralPath $source -PathType Leaf)) {
+        throw "GameServerDll not found: $source"
+    }
+    Copy-Item -LiteralPath $source -Destination (Join-Path $stage "GameServer.dll") -Force
+    Write-Host "Public Tools server: $source"
+}
 Write-Host "Stage ready: $stage"
 
 $exe = Join-Path $stage "Lithtech.exe"
-$arguments = @("-fear", "-workingdir", ('"' + $stage + '"'), "-archcfg", "Default.archcfg")
+$arguments = @(
+    "-fear",
+    "-workingdir", ('"' + $stage + '"'),
+    "-archcfg", "Default.archcfg",
+    "+windowed", "1",
+    "+screenwidth", "$ScreenWidth",
+    "+screenheight", "$ScreenHeight"
+)
 Write-Host ('Command line: "' + $exe + '" ' + ($arguments -join ' '))
+Write-Host "Windowed resolution: ${ScreenWidth}x${ScreenHeight}"
 
 if ($NoRun) {
     Write-Host "-NoRun specified, engine not launched."

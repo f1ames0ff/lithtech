@@ -34,6 +34,11 @@ struct FearRenderApi
     void  (*SetWorldCamera)(const float *pPos, float fYaw, float fPitch);
     void  (*SetCameraFov)(float fFovX, float fFovY);
     int   (*MakeScreenShot)(const char *pszFilename);
+    void  (*SetViewportRect)(const float *pRect);
+    int   (*QueueModel)(const char *pszFilename, const char *pszMaterial, const float *pTransform);
+    int   (*QueueSkinnedModel)(const char *pszFilename, const char *pszMaterial, const float *pTransform,
+                               const float *pNodeMatrices, unsigned int nNodeCount);
+    void *(*CreateMaterialTexture)(const char *pszMaterial);
 };
 
 typedef struct FearRenderApi FearRenderApi;

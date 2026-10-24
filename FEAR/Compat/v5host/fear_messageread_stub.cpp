@@ -1,9 +1,31 @@
 #include "fear_messageread_stub.h"
 #include "fear_object_map.h"
+#include "fear_server_host.h"
 #include <string.h>
 #include <wchar.h>
 
-CFearMessageRead g_FearMessageRead;
+
+
+void CFearMessageRead::AddRef()
+{
+    ++m_nRefs;
+}
+
+void CFearMessageRead::Release()
+{
+    if (--m_nRefs <= 0)
+        delete this;
+}
+
+void CFearMessageRead::StaticRelease()
+{
+    Release();
+}
+
+void CFearMessageRead::Free()
+{
+    Release();
+}
 
 void CFearMessageRead::SetData(const uint8 *pData, uint32 nBits)
 {
@@ -226,11 +248,23 @@ LTRotation CFearMessageRead::ReadCompLTRotation()
 
 HOBJECT CFearMessageRead::ReadObject()
 {
-    uint32 nID = ReadBits(16);
-    if (nID == 0xFFFF)
+    uint32 nID = ReadBits(15);
+    if (nID == FEAR_INVALID_OBJECT_ID)
         return NULL;
     if (FearClient_IsServerMessage())
         return FearClient_ResolveServerObject((unsigned short)nID);
+
+    HOBJECT hServerObject = (HOBJECT)FearServerHost_ResolveObject((unsigned short)nID);
+    if (hServerObject)
+        return hServerObject;
+
+    static int s_nMissingObjectLogs = 0;
+    if (s_nMissingObjectLogs < 8)
+    {
+        ++s_nMissingObjectLogs;
+        printf("FEARMSG: unresolved client object id=%u\n", (unsigned)nID);
+        fflush(stdout);
+    }
     return (HOBJECT)(uintptr_t)nID;
 }
 
@@ -259,7 +293,14 @@ HRECORD CFearMessageRead::ReadDatabaseRecord(IDatabaseMgr *pDatabase, HCATEGORY 
         return NULL;
     }
 
+    const char *pszCategory = pDatabase->GetCategoryName(hCategory);
+    uint32 nCount = pDatabase->GetNumRecords(hCategory);
     HRECORD hRecord = pDatabase->GetRecordByIndex(hCategory, nIndex);
+    const char *pszRecord = hRecord ? pDatabase->GetRecordName(hRecord) : NULL;
+    printf("FEARDB: index=%u cat='%s' count=%u rec=%p name='%s'\n",
+        (unsigned)nIndex, pszCategory ? pszCategory : "(null)", (unsigned)nCount,
+        (void *)hRecord, pszRecord ? pszRecord : "(null)");
+    fflush(stdout);
     gos_LogDbRecord(nIndex, hCategory, hRecord, 0);
     return hRecord;
 }

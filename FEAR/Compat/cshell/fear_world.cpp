@@ -10,6 +10,7 @@
 #include <math.h>
 #include <vector>
 #include <string>
+#include <map>
 #include <new>
 
 struct FearWorldVertex
@@ -48,13 +49,29 @@ struct FearWorldBatch
 
 static std::vector<FearWorldBatch> g_WorldBatches;
 static bool g_bWorldLoaded = false;
+static bool g_bWorldTexturesLoaded = false;
 static float g_WorldMin[3] = {0, 0, 0};
 static float g_WorldMax[3] = {0, 0, 0};
 static float g_CameraPos[3] = { -1100.0f, -1372.0f, -370.0f };
+
+struct FearCollisionTri
+{
+    float m_Verts[3][3];
+};
+
+static void FearWorld_BuildCollision();
+static std::vector<FearCollisionTri> g_CollisionTris;
+static std::vector<std::vector<unsigned int> > g_CollisionCells;
+static float g_CollOriginX = 0.0f;
+static float g_CollOriginZ = 0.0f;
+static float g_CollCellSize = 256.0f;
+static int g_CollDimX = 0;
+static int g_CollDimZ = 0;
 static float g_CameraYaw = -0.0784588f;
 static float g_CameraPitch = 0.0f;
 static float g_CameraFovX = 0.0f;
 static float g_CameraFovY = 0.0f;
+static float g_CameraViewport[4] = {0.0f, 0.0f, 1.0f, 1.0f};
 
 static DWORD FearWorldCullMode()
 {
@@ -955,6 +972,7 @@ int FearWorld_Load(const char *pszFilename)
         return 0;
     }
 
+    FearWorld_BuildCollision();
     printf("FEARWORLD: surfaces=%u visible_surfaces=%u skipped_shadow_surfaces=%u unknown_vertex_types=%u materials=%u used_materials=%u vertices=%u triangles=%u bounds=(%.0f,%.0f,%.0f)-(%.0f,%.0f,%.0f)\n",
         nSurfaceCount, nVisibleSurfaces, nSkippedSurfaces, nUnknownVertexTypes, nMaterialCount, nUsedMaterials,
         nVertexCount, nVertexCount / 3,
@@ -1031,10 +1049,115 @@ static FearMatrix FearMatrixMultiply(const FearMatrix &a, const FearMatrix &b)
     return r;
 }
 
+static std::string FearWorldTextureCacheKey(const char *pszFilename)
+{
+    std::string key = pszFilename ? pszFilename : "";
+    for (size_t i = 0; i < key.size(); ++i)
+    {
+        if (key[i] == '/')
+            key[i] = '\\';
+        if (key[i] >= 'A' && key[i] <= 'Z')
+            key[i] = (char)(key[i] - 'A' + 'a');
+    }
+    return key;
+}
+
+static unsigned int FearWorldTextureLimit()
+{
+    static int s_nLimit = -1;
+    if (s_nLimit < 0)
+    {
+        char szValue[32] = {0};
+        s_nLimit = 256;
+        if (GetEnvironmentVariableA("FEAR_TEXTURE_MAX", szValue, sizeof(szValue)) > 0)
+            s_nLimit = atoi(szValue);
+        if (s_nLimit < 32)
+            s_nLimit = 32;
+        if (s_nLimit > 2048)
+            s_nLimit = 2048;
+    }
+    return (unsigned int)s_nLimit;
+}
+
+static bool FearWorldLoadAuxTextures()
+{
+    static int s_nLoadAux = -1;
+    if (s_nLoadAux < 0)
+    {
+        char szValue[8] = {0};
+        s_nLoadAux = GetEnvironmentVariableA("FEAR_LOAD_AUX_TEXTURES", szValue, sizeof(szValue)) > 0 &&
+            szValue[0] && szValue[0] != '0';
+    }
+    return s_nLoadAux != 0;
+}
+
+static unsigned char *FearWorldResizeRGBA8(const FearDDSImage &image,
+    unsigned int nWidth, unsigned int nHeight)
+{
+    if (!image.m_pPixels || image.m_Width == 0 || image.m_Height == 0 || nWidth == 0 || nHeight == 0)
+        return NULL;
+
+    size_t nBytes = (size_t)nWidth * (size_t)nHeight * 4;
+    unsigned char *pPixels = new (std::nothrow) unsigned char[nBytes];
+    if (!pPixels)
+        return NULL;
+
+    for (unsigned int nY = 0; nY < nHeight; ++nY)
+    {
+        float fSourceY = ((float)nY + 0.5f) * (float)image.m_Height / (float)nHeight - 0.5f;
+        if (fSourceY < 0.0f)
+            fSourceY = 0.0f;
+        if (fSourceY > (float)(image.m_Height - 1))
+            fSourceY = (float)(image.m_Height - 1);
+
+        unsigned int nY0 = (unsigned int)fSourceY;
+        unsigned int nY1 = nY0 + 1 < image.m_Height ? nY0 + 1 : nY0;
+        float fTY = fSourceY - (float)nY0;
+
+        for (unsigned int nX = 0; nX < nWidth; ++nX)
+        {
+            float fSourceX = ((float)nX + 0.5f) * (float)image.m_Width / (float)nWidth - 0.5f;
+            if (fSourceX < 0.0f)
+                fSourceX = 0.0f;
+            if (fSourceX > (float)(image.m_Width - 1))
+                fSourceX = (float)(image.m_Width - 1);
+
+            unsigned int nX0 = (unsigned int)fSourceX;
+            unsigned int nX1 = nX0 + 1 < image.m_Width ? nX0 + 1 : nX0;
+            float fTX = fSourceX - (float)nX0;
+
+            const unsigned char *p00 = image.m_pPixels + ((size_t)nY0 * image.m_Width + nX0) * 4;
+            const unsigned char *p10 = image.m_pPixels + ((size_t)nY0 * image.m_Width + nX1) * 4;
+            const unsigned char *p01 = image.m_pPixels + ((size_t)nY1 * image.m_Width + nX0) * 4;
+            const unsigned char *p11 = image.m_pPixels + ((size_t)nY1 * image.m_Width + nX1) * 4;
+            unsigned char *pDestination = pPixels + ((size_t)nY * nWidth + nX) * 4;
+
+            for (int nChannel = 0; nChannel < 4; ++nChannel)
+            {
+                float fTop = p00[nChannel] + (p10[nChannel] - p00[nChannel]) * fTX;
+                float fBottom = p01[nChannel] + (p11[nChannel] - p01[nChannel]) * fTX;
+                pDestination[nChannel] = (unsigned char)(fTop + (fBottom - fTop) * fTY + 0.5f);
+            }
+        }
+    }
+
+    return pPixels;
+}
+
+static std::map<std::string, IDirect3DTexture9 *> g_WorldTextureCache;
+
 static IDirect3DTexture9 *FearWorldLoadDDS(IDirect3DDevice9 *pDevice, const char *pszFilename)
 {
     if (!pDevice || !pszFilename || !pszFilename[0])
         return NULL;
+
+    const std::string cacheKey = FearWorldTextureCacheKey(pszFilename);
+    std::map<std::string, IDirect3DTexture9 *>::iterator cached = g_WorldTextureCache.find(cacheKey);
+    if (cached != g_WorldTextureCache.end())
+    {
+        cached->second->AddRef();
+        return cached->second;
+    }
 
     std::vector<unsigned char> data;
     if (!FearReadFile(pszFilename, data))
@@ -1084,10 +1207,32 @@ static IDirect3DTexture9 *FearWorldLoadDDS(IDirect3DDevice9 *pDevice, const char
         fflush(stdout);
     }
 
+    unsigned int nUploadWidth = image.m_Width;
+    unsigned int nUploadHeight = image.m_Height;
+    unsigned int nMaxDimension = FearWorldTextureLimit();
+    unsigned int nSourceMax = image.m_Width > image.m_Height ? image.m_Width : image.m_Height;
+    const unsigned char *pUploadPixels = image.m_pPixels;
+    unsigned char *pResizedPixels = NULL;
+    if (nSourceMax > nMaxDimension)
+    {
+        nUploadWidth = (image.m_Width * nMaxDimension) / nSourceMax;
+        nUploadHeight = (image.m_Height * nMaxDimension) / nSourceMax;
+        if (nUploadWidth == 0) nUploadWidth = 1;
+        if (nUploadHeight == 0) nUploadHeight = 1;
+        pResizedPixels = FearWorldResizeRGBA8(image, nUploadWidth, nUploadHeight);
+        if (!pResizedPixels)
+        {
+            FearDDS_Free(image);
+            return NULL;
+        }
+        pUploadPixels = pResizedPixels;
+    }
+
     IDirect3DTexture9 *pTexture = NULL;
-    if (FAILED(pDevice->CreateTexture(image.m_Width, image.m_Height, 1, 0,
+    if (FAILED(pDevice->CreateTexture(nUploadWidth, nUploadHeight, 1, 0,
         D3DFMT_A8R8G8B8, D3DPOOL_MANAGED, &pTexture, NULL)))
     {
+        delete [] pResizedPixels;
         FearDDS_Free(image);
         return NULL;
     }
@@ -1097,15 +1242,16 @@ static IDirect3DTexture9 *FearWorldLoadDDS(IDirect3DDevice9 *pDevice, const char
     if (FAILED(pTexture->LockRect(0, &locked, NULL, 0)))
     {
         pTexture->Release();
+        delete [] pResizedPixels;
         FearDDS_Free(image);
         return NULL;
     }
 
-    for (unsigned int y = 0; y < image.m_Height; ++y)
+    for (unsigned int y = 0; y < nUploadHeight; ++y)
     {
         unsigned char *pDest = (unsigned char *)locked.pBits + (size_t)y * locked.Pitch;
-        const unsigned char *pSource = image.m_pPixels + (size_t)y * image.m_Width * 4;
-        for (unsigned int x = 0; x < image.m_Width; ++x)
+        const unsigned char *pSource = pUploadPixels + (size_t)y * nUploadWidth * 4;
+        for (unsigned int x = 0; x < nUploadWidth; ++x)
         {
             pDest[x * 4 + 0] = pSource[x * 4 + 2];
             pDest[x * 4 + 1] = pSource[x * 4 + 1];
@@ -1115,7 +1261,10 @@ static IDirect3DTexture9 *FearWorldLoadDDS(IDirect3DDevice9 *pDevice, const char
     }
 
     pTexture->UnlockRect(0);
+    delete [] pResizedPixels;
     FearDDS_Free(image);
+    g_WorldTextureCache[cacheKey] = pTexture;
+    pTexture->AddRef();
     return pTexture;
 }
 
@@ -1139,20 +1288,50 @@ static void FearWorldLoadTextures(IDirect3DDevice9 *pDevice)
         batch.m_pTexture = FearWorldLoadDDS(pDevice, maps.m_Diffuse.c_str());
         if (batch.m_pTexture)
             ++nLoaded;
-        batch.m_pNormalTexture = FearWorldLoadDDS(pDevice, maps.m_Normal.c_str());
-        if (batch.m_pNormalTexture)
-            ++nNormal;
-        batch.m_pSpecularTexture = FearWorldLoadDDS(pDevice, maps.m_Specular.c_str());
-        if (batch.m_pSpecularTexture)
-            ++nSpecular;
-        batch.m_pEmissiveTexture = FearWorldLoadDDS(pDevice, maps.m_Emissive.c_str());
-        if (batch.m_pEmissiveTexture)
-            ++nEmissive;
+        if (FearWorldLoadAuxTextures())
+        {
+            batch.m_pNormalTexture = FearWorldLoadDDS(pDevice, maps.m_Normal.c_str());
+            if (batch.m_pNormalTexture)
+                ++nNormal;
+            batch.m_pSpecularTexture = FearWorldLoadDDS(pDevice, maps.m_Specular.c_str());
+            if (batch.m_pSpecularTexture)
+                ++nSpecular;
+            batch.m_pEmissiveTexture = FearWorldLoadDDS(pDevice, maps.m_Emissive.c_str());
+            if (batch.m_pEmissiveTexture)
+                ++nEmissive;
+        }
     }
 
-    printf("FEARWORLD: loaded %u material textures (normal=%u specular=%u emissive=%u)\n",
-        nLoaded, nNormal, nSpecular, nEmissive);
+    printf("FEARWORLD: loaded %u material textures (normal=%u specular=%u emissive=%u cache=%u max=%u)\n",
+        nLoaded, nNormal, nSpecular, nEmissive, (unsigned)g_WorldTextureCache.size(),
+        FearWorldTextureLimit());
     fflush(stdout);
+}
+
+IDirect3DTexture9 *FearWorld_LoadMaterialTexture(
+    IDirect3DDevice9 *pDevice, const char *pszMaterial)
+{
+    if (!pDevice || !pszMaterial || !pszMaterial[0])
+        return NULL;
+
+    FearMaterialMaps maps;
+    if (!FearReadMaterialTexture(pszMaterial, maps) || maps.m_Diffuse.empty())
+        return NULL;
+    return FearWorldLoadDDS(pDevice, maps.m_Diffuse.c_str());
+}
+
+bool FearWorld_GetMaterialDiffuse(
+    const char *pszMaterial, char *pszDiffuse, unsigned int nLength)
+{
+    if (!pszMaterial || !pszDiffuse || nLength == 0)
+        return false;
+    pszDiffuse[0] = '\0';
+    FearMaterialMaps maps;
+    if (!FearReadMaterialTexture(pszMaterial, maps) || maps.m_Diffuse.empty())
+        return false;
+    strncpy(pszDiffuse, maps.m_Diffuse.c_str(), nLength - 1);
+    pszDiffuse[nLength - 1] = '\0';
+    return true;
 }
 
 static bool FearWorldCreateBatchBuffer(IDirect3DDevice9 *pDevice, FearWorldBatch &batch)
@@ -1507,7 +1686,7 @@ static bool FearWorldInitShaders(IDirect3DDevice9 *pDevice)
     g_FearShaders.m_AmbientScale = FearEnvFloat("FEAR_AMBIENT", 1.0f);
     g_FearShaders.m_Exposure = FearEnvFloat("FEAR_EXPOSURE", 0.72f);
     g_FearShaders.m_SpecularScale = FearEnvFloat("FEAR_SPECULAR", 1.0f);
-    g_FearShaders.m_bNormalMaps = FearEnvFloat("FEAR_NORMALMAP", 1.0f) > 0.5f;
+    g_FearShaders.m_bNormalMaps = FearEnvFloat("FEAR_NORMALMAP", 0.0f) > 0.5f;
     g_FearShaders.m_VCol = FearEnvFloat("FEAR_VCOL", 1.0f);
     g_FearShaders.m_ToneMode = FearEnvFloat("FEAR_TONE", 1.0f) > 0.5f ? 1 : 0;
     g_FearShaders.m_bUsable = true;
@@ -1660,7 +1839,7 @@ static void FearWorldQueueModels()
     m[14] = origin[2] - (row0[2] * ctr[0] + row1[2] * ctr[1] + row2[2] * ctr[2]);
     m[15] = 1.0f;
 
-    FearModel_Queue(g_pDebugModel, m);
+    FearModel_Queue(g_pDebugModel, NULL, m);
 }
 
 void FearWorld_Render(IDirect3DDevice9 *pDevice)
@@ -1691,10 +1870,9 @@ void FearWorld_Render(IDirect3DDevice9 *pDevice)
         fflush(stdout);
     }
 
-    static bool s_bTexturesLoaded = false;
-    if (!s_bTexturesLoaded)
+    if (!g_bWorldTexturesLoaded)
     {
-        s_bTexturesLoaded = true;
+        g_bWorldTexturesLoaded = true;
         FearWorldLoadTextures(pDevice);
     }
 
@@ -1708,6 +1886,40 @@ void FearWorld_Render(IDirect3DDevice9 *pDevice)
     float up[3] = { 0.0f, 1.0f, 0.0f };
 
     pDevice->Clear(0, NULL, D3DCLEAR_TARGET | D3DCLEAR_ZBUFFER, 0xff101018, 1.0f, 0);
+
+    D3DVIEWPORT9 previousViewport;
+    pDevice->GetViewport(&previousViewport);
+    UINT nTargetWidth = previousViewport.Width;
+    UINT nTargetHeight = previousViewport.Height;
+    IDirect3DSurface9 *pRenderTarget = NULL;
+    if (SUCCEEDED(pDevice->GetRenderTarget(0, &pRenderTarget)) && pRenderTarget)
+    {
+        D3DSURFACE_DESC targetDesc;
+        if (SUCCEEDED(pRenderTarget->GetDesc(&targetDesc)))
+        {
+            nTargetWidth = targetDesc.Width;
+            nTargetHeight = targetDesc.Height;
+        }
+        pRenderTarget->Release();
+    }
+
+    D3DVIEWPORT9 viewport;
+    viewport.X = (DWORD)(g_CameraViewport[0] * (float)nTargetWidth + 0.5f);
+    viewport.Y = (DWORD)(g_CameraViewport[1] * (float)nTargetHeight + 0.5f);
+    viewport.Width = (DWORD)((g_CameraViewport[2] - g_CameraViewport[0]) * (float)nTargetWidth + 0.5f);
+    viewport.Height = (DWORD)((g_CameraViewport[3] - g_CameraViewport[1]) * (float)nTargetHeight + 0.5f);
+    viewport.MinZ = 0.0f;
+    viewport.MaxZ = 1.0f;
+    if (viewport.Width == 0 || viewport.Height == 0 ||
+        viewport.X >= nTargetWidth || viewport.Y >= nTargetHeight)
+    {
+        viewport.X = 0;
+        viewport.Y = 0;
+        viewport.Width = nTargetWidth;
+        viewport.Height = nTargetHeight;
+    }
+    pDevice->SetViewport(&viewport);
+
     pDevice->SetRenderState(D3DRS_LIGHTING, FALSE);
     pDevice->SetRenderState(D3DRS_ZENABLE, TRUE);
     pDevice->SetRenderState(D3DRS_CULLMODE, FearWorldCullMode());
@@ -1805,8 +2017,8 @@ void FearWorld_Render(IDirect3DDevice9 *pDevice)
         {
             pDevice->SetTexture(0, batch.m_pTexture ? batch.m_pTexture : g_FearShaders.m_pWhite);
             pDevice->SetTexture(1, batch.m_pNormalTexture);
-            pDevice->SetTexture(2, batch.m_pSpecularTexture);
-            pDevice->SetTexture(3, batch.m_pEmissiveTexture);
+            pDevice->SetTexture(2, batch.m_pSpecularTexture ? batch.m_pSpecularTexture : g_FearShaders.m_pBlack);
+            pDevice->SetTexture(3, batch.m_pEmissiveTexture ? batch.m_pEmissiveTexture : g_FearShaders.m_pBlack);
 
             float fTint[4] = { 1.0f, 1.0f, 1.0f, g_FearShaders.m_VCol };
             if (!batch.m_pTexture)
@@ -1899,6 +2111,7 @@ void FearWorld_Render(IDirect3DDevice9 *pDevice)
     }
 
     FearModel_RenderQueued(pDevice, view.m, proj.m, eye, fFovY, fAspect);
+    pDevice->SetViewport(&previousViewport);
 }
 
 void FearWorld_SetCamera(const float *pPos, float fYaw, float fPitch)
@@ -1915,6 +2128,49 @@ void FearWorld_SetCamera(const float *pPos, float fYaw, float fPitch)
     if (fPitch < -1.35f)
         fPitch = -1.35f;
     g_CameraPitch = fPitch;
+}
+
+void FearWorld_SetViewport(const float *pRect)
+{
+    float values[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+    if (pRect)
+    {
+        for (int i = 0; i < 4; ++i)
+        {
+            values[i] = pRect[i];
+            if (values[i] < 0.0f)
+                values[i] = 0.0f;
+            if (values[i] > 1.0f)
+                values[i] = 1.0f;
+        }
+        if (values[2] < values[0])
+        {
+            float fTemp = values[0];
+            values[0] = values[2];
+            values[2] = fTemp;
+        }
+        if (values[3] < values[1])
+        {
+            float fTemp = values[1];
+            values[1] = values[3];
+            values[3] = fTemp;
+        }
+        if (values[2] - values[0] < 1.0e-4f || values[3] - values[1] < 1.0e-4f)
+        {
+            values[0] = 0.0f;
+            values[1] = 0.0f;
+            values[2] = 1.0f;
+            values[3] = 1.0f;
+        }
+    }
+
+    if (memcmp(g_CameraViewport, values, sizeof(values)) == 0)
+        return;
+
+    memcpy(g_CameraViewport, values, sizeof(values));
+    printf("FEARWORLD: viewport %.3f %.3f %.3f %.3f\n",
+        values[0], values[1], values[2], values[3]);
+    fflush(stdout);
 }
 
 void FearWorld_SetFov(float fFovX, float fFovY)
@@ -1965,8 +2221,235 @@ void FearWorld_Shutdown()
         }
         batch.m_Vertices.clear();
     }
+    for (std::map<std::string, IDirect3DTexture9 *>::iterator it = g_WorldTextureCache.begin();
+        it != g_WorldTextureCache.end(); ++it)
+    {
+        if (it->second)
+            it->second->Release();
+    }
+    g_WorldTextureCache.clear();
+    g_bWorldTexturesLoaded = false;
+
     FearWorldDestroyShaders();
     g_bShadersTried = false;
     g_WorldBatches.clear();
     g_bWorldLoaded = false;
+}
+
+static void FearWorld_BuildCollision()
+{
+    g_CollisionTris.clear();
+    g_CollisionCells.clear();
+
+    for (size_t i = 0; i < g_WorldBatches.size(); ++i)
+    {
+        const FearWorldBatch &batch = g_WorldBatches[i];
+        for (size_t j = 0; j + 2 < batch.m_Vertices.size(); j += 3)
+        {
+            FearCollisionTri tri;
+            const FearWorldVertex *v0 = &batch.m_Vertices[j];
+            const FearWorldVertex *v1 = &batch.m_Vertices[j + 1];
+            const FearWorldVertex *v2 = &batch.m_Vertices[j + 2];
+            tri.m_Verts[0][0] = v0->x; tri.m_Verts[0][1] = v0->y; tri.m_Verts[0][2] = v0->z;
+            tri.m_Verts[1][0] = v1->x; tri.m_Verts[1][1] = v1->y; tri.m_Verts[1][2] = v1->z;
+            tri.m_Verts[2][0] = v2->x; tri.m_Verts[2][1] = v2->y; tri.m_Verts[2][2] = v2->z;
+            g_CollisionTris.push_back(tri);
+        }
+    }
+
+    if (g_CollisionTris.empty())
+        return;
+
+    float spanX = g_WorldMax[0] - g_WorldMin[0];
+    float spanZ = g_WorldMax[2] - g_WorldMin[2];
+    if (spanX < 1.0f) spanX = 1.0f;
+    if (spanZ < 1.0f) spanZ = 1.0f;
+
+    g_CollCellSize = 256.0f;
+    for (;;)
+    {
+        g_CollDimX = (int)(spanX / g_CollCellSize) + 1;
+        g_CollDimZ = (int)(spanZ / g_CollCellSize) + 1;
+        if ((long long)g_CollDimX * g_CollDimZ <= 262144)
+            break;
+        g_CollCellSize *= 2.0f;
+    }
+
+    g_CollOriginX = g_WorldMin[0];
+    g_CollOriginZ = g_WorldMin[2];
+    g_CollisionCells.assign((size_t)g_CollDimX * g_CollDimZ, std::vector<unsigned int>());
+
+    for (size_t i = 0; i < g_CollisionTris.size(); ++i)
+    {
+        const FearCollisionTri &tri = g_CollisionTris[i];
+        float minX = tri.m_Verts[0][0], maxX = minX;
+        float minZ = tri.m_Verts[0][2], maxZ = minZ;
+        for (int k = 1; k < 3; ++k)
+        {
+            if (tri.m_Verts[k][0] < minX) minX = tri.m_Verts[k][0];
+            if (tri.m_Verts[k][0] > maxX) maxX = tri.m_Verts[k][0];
+            if (tri.m_Verts[k][2] < minZ) minZ = tri.m_Verts[k][2];
+            if (tri.m_Verts[k][2] > maxZ) maxZ = tri.m_Verts[k][2];
+        }
+
+        int x0 = (int)((minX - g_CollOriginX) / g_CollCellSize);
+        int x1 = (int)((maxX - g_CollOriginX) / g_CollCellSize);
+        int z0 = (int)((minZ - g_CollOriginZ) / g_CollCellSize);
+        int z1 = (int)((maxZ - g_CollOriginZ) / g_CollCellSize);
+        if (x0 < 0) x0 = 0;
+        if (z0 < 0) z0 = 0;
+        if (x1 >= g_CollDimX) x1 = g_CollDimX - 1;
+        if (z1 >= g_CollDimZ) z1 = g_CollDimZ - 1;
+        if (x0 > x1 || z0 > z1) continue;
+
+        for (int z = z0; z <= z1; ++z)
+            for (int x = x0; x <= x1; ++x)
+                g_CollisionCells[(size_t)z * g_CollDimX + x].push_back((unsigned int)i);
+    }
+
+    printf("FEARCOLL: triangles=%u grid=%dx%d cell=%.0f\n",
+        (unsigned)g_CollisionTris.size(), g_CollDimX, g_CollDimZ, g_CollCellSize);
+    fflush(stdout);
+
+    {
+        const float vFrom[3] = { -1100.0f, -1436.0f, -370.0f };
+        const float vDirs[5][3] = { {1.0f,0.0f,0.0f}, {-1.0f,0.0f,0.0f}, {0.0f,0.0f,1.0f}, {0.0f,0.0f,-1.0f}, {0.0f,-1.0f,0.0f} };
+        const float vLens[5] = { 5000.0f, 5000.0f, 5000.0f, 5000.0f, 128.0f };
+        for (int i = 0; i < 5; ++i)
+        {
+            float vTo[3] = { vFrom[0] + vDirs[i][0] * vLens[i],
+                             vFrom[1] + vDirs[i][1] * vLens[i],
+                             vFrom[2] + vDirs[i][2] * vLens[i] };
+            float vHit[3] = {0,0,0};
+            float vNormal[3] = {0,1,0};
+            float fDist = 0.0f;
+            int nHit = FearWorld_IntersectSegment(vFrom, vTo, vHit, vNormal, &fDist);
+            printf("FEARCOLLTEST: dir=%d hit=%d dist=%.1f point=%.1f %.1f %.1f n=%.2f %.2f %.2f\n",
+                i, nHit, fDist, vHit[0], vHit[1], vHit[2], vNormal[0], vNormal[1], vNormal[2]);
+        }
+        fflush(stdout);
+    }
+}
+
+static bool FearWorld_RayTri(const float *pOrigin, const float *pDir, const FearCollisionTri &tri, float &fT, float *pNormal)
+{
+    float e1[3], e2[3];
+    e1[0] = tri.m_Verts[1][0] - tri.m_Verts[0][0];
+    e1[1] = tri.m_Verts[1][1] - tri.m_Verts[0][1];
+    e1[2] = tri.m_Verts[1][2] - tri.m_Verts[0][2];
+    e2[0] = tri.m_Verts[2][0] - tri.m_Verts[0][0];
+    e2[1] = tri.m_Verts[2][1] - tri.m_Verts[0][1];
+    e2[2] = tri.m_Verts[2][2] - tri.m_Verts[0][2];
+
+    float p[3];
+    p[0] = pDir[1] * e2[2] - pDir[2] * e2[1];
+    p[1] = pDir[2] * e2[0] - pDir[0] * e2[2];
+    p[2] = pDir[0] * e2[1] - pDir[1] * e2[0];
+
+    float fDet = e1[0] * p[0] + e1[1] * p[1] + e1[2] * p[2];
+    if (fDet > -1.0e-8f && fDet < 1.0e-8f)
+        return false;
+
+    float fInv = 1.0f / fDet;
+    float t[3];
+    t[0] = pOrigin[0] - tri.m_Verts[0][0];
+    t[1] = pOrigin[1] - tri.m_Verts[0][1];
+    t[2] = pOrigin[2] - tri.m_Verts[0][2];
+
+    float fU = (t[0] * p[0] + t[1] * p[1] + t[2] * p[2]) * fInv;
+    if (fU < 0.0f || fU > 1.0f)
+        return false;
+
+    float q[3];
+    q[0] = t[1] * e1[2] - t[2] * e1[1];
+    q[1] = t[2] * e1[0] - t[0] * e1[2];
+    q[2] = t[0] * e1[1] - t[1] * e1[0];
+
+    float fV = (pDir[0] * q[0] + pDir[1] * q[1] + pDir[2] * q[2]) * fInv;
+    if (fV < 0.0f || (fU + fV) > 1.0f)
+        return false;
+
+    float fRayT = (e2[0] * q[0] + e2[1] * q[1] + e2[2] * q[2]) * fInv;
+    if (fRayT <= 1.0e-5f || fRayT >= 1.0f)
+        return false;
+
+    fT = fRayT;
+
+    float n[3];
+    n[0] = e1[1] * e2[2] - e1[2] * e2[1];
+    n[1] = e1[2] * e2[0] - e1[0] * e2[2];
+    n[2] = e1[0] * e2[1] - e1[1] * e2[0];
+    float fLen = sqrtf(n[0] * n[0] + n[1] * n[1] + n[2] * n[2]);
+    if (fLen > 1.0e-8f)
+    {
+        pNormal[0] = n[0] / fLen;
+        pNormal[1] = n[1] / fLen;
+        pNormal[2] = n[2] / fLen;
+    }
+    return true;
+}
+
+extern "C" int FearWorld_IntersectSegment(const float *pFrom, const float *pTo, float *pHit, float *pNormal, float *pDist)
+{
+    if (!pFrom || !pTo || !pHit || !pNormal || !pDist)
+        return 0;
+    if (g_CollisionTris.empty() || g_CollisionCells.empty())
+        return 0;
+
+    float dir[3];
+    dir[0] = pTo[0] - pFrom[0];
+    dir[1] = pTo[1] - pFrom[1];
+    dir[2] = pTo[2] - pFrom[2];
+
+    float fDist = sqrtf(dir[0] * dir[0] + dir[1] * dir[1] + dir[2] * dir[2]);
+    if (fDist < 1.0e-5f)
+        return 0;
+
+    float fDist2D = sqrtf(dir[0] * dir[0] + dir[2] * dir[2]);
+    int nSteps = (int)(fDist2D / (g_CollCellSize * 0.5f)) + 2;
+    if (nSteps > 512)
+        nSteps = 512;
+
+    float fBest = 1.0e30f;
+    const FearCollisionTri *pBest = NULL;
+    int nLastCell = -1;
+
+    for (int s = 0; s <= nSteps; ++s)
+    {
+        float fT = (float)s / (float)nSteps;
+        int cx = (int)((pFrom[0] + dir[0] * fT - g_CollOriginX) / g_CollCellSize);
+        int cz = (int)((pFrom[2] + dir[2] * fT - g_CollOriginZ) / g_CollCellSize);
+        if (cx < 0 || cx >= g_CollDimX || cz < 0 || cz >= g_CollDimZ)
+            continue;
+
+        int nCell = cz * g_CollDimX + cx;
+        if (nCell == nLastCell)
+            continue;
+        nLastCell = nCell;
+
+        const std::vector<unsigned int> &cell = g_CollisionCells[(size_t)nCell];
+        for (size_t i = 0; i < cell.size(); ++i)
+        {
+            const FearCollisionTri &tri = g_CollisionTris[cell[i]];
+            float fTriT = 0.0f;
+            float n[3] = {0.0f, 0.0f, 0.0f};
+            if (FearWorld_RayTri(pFrom, dir, tri, fTriT, n) && fTriT < fBest)
+            {
+                fBest = fTriT;
+                pBest = &tri;
+                pNormal[0] = n[0];
+                pNormal[1] = n[1];
+                pNormal[2] = n[2];
+            }
+        }
+    }
+
+    if (!pBest)
+        return 0;
+
+    pHit[0] = pFrom[0] + dir[0] * fBest;
+    pHit[1] = pFrom[1] + dir[1] * fBest;
+    pHit[2] = pFrom[2] + dir[2] * fBest;
+    *pDist = fDist * fBest;
+    return 1;
 }

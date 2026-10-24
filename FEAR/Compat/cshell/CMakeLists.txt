@@ -45,6 +45,8 @@ target_link_libraries(${PROJECT_NAME} PRIVATE
     LIB_ZLib
     winmm
     d3d9
+    dxgi
+    advapi32
     dbghelp)
 
 set_target_properties(${PROJECT_NAME} PROPERTIES

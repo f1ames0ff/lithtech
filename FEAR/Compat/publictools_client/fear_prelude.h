@@ -3,6 +3,7 @@
 #include <windows.h>
 #include <mmsystem.h>
 #include <ctype.h>
+#include "resourceextensions.h"
 #include <string>
 #include <algorithm>
 #include <vector>

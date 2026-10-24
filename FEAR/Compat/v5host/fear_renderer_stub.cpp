@@ -6,6 +6,9 @@
 #include <stdio.h>
 #include <string.h>
 #include <math.h>
+#include <string>
+#include <vector>
+#include <new>
 #include "rendererframestats.h"
 
 template <typename T> struct SvcDefault { static T Get() { return T(); } };
@@ -32,7 +35,18 @@ static CRendererFrameStats g_FrameStats;
 class CFearMaterialInstance
 {
 public:
-    CFearMaterialInstance() : m_nRefCount(1) {}
+    explicit CFearMaterialInstance(const char *pszName)
+        : m_Name(pszName ? pszName : ""), m_hTexture(NULL),
+          m_bTextureTried(false), m_nRefCount(1)
+    {
+    }
+
+    ~CFearMaterialInstance()
+    {
+        const FearRenderApi *pRender = FearRender();
+        if (m_hTexture && pRender && pRender->ReleaseTexture)
+            pRender->ReleaseTexture(m_hTexture);
+    }
 
     LONG AddRef()
     {
@@ -43,32 +57,112 @@ public:
     {
         LONG nRefCount = InterlockedDecrement(&m_nRefCount);
         if (nRefCount < 1)
-        {
-            InterlockedExchange(&m_nRefCount, 1);
-            nRefCount = 1;
-        }
+            delete this;
         return nRefCount;
     }
 
-    virtual void *FearMaterialInstanceAnchor() { return NULL; }
+    void *GetTexture()
+    {
+        if (!m_bTextureTried)
+        {
+            m_bTextureTried = true;
+            const FearRenderApi *pRender = FearRender();
+            if (pRender && pRender->CreateMaterialTexture)
+                m_hTexture = pRender->CreateMaterialTexture(m_Name.c_str());
+        }
+        return m_hTexture;
+    }
+
+    const std::string &GetName() const
+    {
+        return m_Name;
+    }
 
 private:
+    std::string m_Name;
+    void *m_hTexture;
+    bool m_bTextureTried;
     volatile LONG m_nRefCount;
 };
 
-static CFearMaterialInstance g_FearMaterialInstance;
+extern "C" void *FearRenderer_GetMaterialTexture(HMATERIAL hMaterial)
+{
+    CFearMaterialInstance *pMaterial =
+        reinterpret_cast<CFearMaterialInstance *>(hMaterial);
+    return pMaterial ? pMaterial->GetTexture() : NULL;
+}
 
 CFearRenderer g_FearRenderer;
 
 RMode* CFearRenderer::GetRenderModes()
 {
-    FEAR_UNIMPL_LOG("ILTRenderer::GetRenderModes");
-    return SvcDefault<RMode*>::Get();
+    const FearEngineApi *pApi = FearHost_GetEngineApi();
+    if (!pApi || !pApi->GetRenderModes)
+    {
+        FEAR_UNIMPL_LOG("ILTRenderer::GetRenderModes");
+        return NULL;
+    }
+
+    const int nCount = pApi->GetRenderModes(NULL, 0);
+    if (nCount <= 0)
+    {
+        printf("FEARRENDER: GetRenderModes returned %d modes\n", nCount);
+        fflush(stdout);
+        return NULL;
+    }
+
+    std::vector<FearMode> modes((size_t)nCount);
+    const int nFilled = pApi->GetRenderModes(&modes[0], nCount);
+    if (nFilled <= 0)
+    {
+        printf("FEARRENDER: GetRenderModes fill failed (%d)\n", nFilled);
+        fflush(stdout);
+        return NULL;
+    }
+    if (nFilled < nCount)
+        modes.resize((size_t)nFilled);
+
+    RMode *pHead = NULL;
+    RMode *pTail = NULL;
+    for (size_t i = 0; i < modes.size(); ++i)
+    {
+        RMode *pMode = new (std::nothrow) RMode;
+        if (!pMode)
+        {
+            RelinquishRenderModes(pHead);
+            return NULL;
+        }
+
+        memset(pMode, 0, sizeof(*pMode));
+        pMode->m_Width = modes[i].m_Width;
+        pMode->m_Height = modes[i].m_Height;
+        pMode->m_BitDepth = modes[i].m_BitDepth;
+        pMode->m_bHWTnL = modes[i].m_bHWTnL != 0;
+        strncpy(pMode->m_DeviceName, modes[i].m_DeviceName, sizeof(pMode->m_DeviceName) - 1);
+
+        if (pTail)
+            pTail->m_pNext = pMode;
+        else
+            pHead = pMode;
+        pTail = pMode;
+    }
+
+    printf("FEARRENDER: GetRenderModes count=%u first=%ux%u@%u last=%ux%u@%u\n",
+        (unsigned)modes.size(),
+        modes[0].m_Width, modes[0].m_Height, modes[0].m_BitDepth,
+        modes.back().m_Width, modes.back().m_Height, modes.back().m_BitDepth);
+    fflush(stdout);
+    return pHead;
 }
 
 void CFearRenderer::RelinquishRenderModes(RMode *pModes)
 {
-    FEAR_UNIMPL_LOG("ILTRenderer::RelinquishRenderModes");
+    while (pModes)
+    {
+        RMode *pNext = pModes->m_pNext;
+        delete pModes;
+        pModes = pNext;
+    }
 }
 
 LTRESULT CFearRenderer::GetCurrentRenderTargetDims(uint32& nWidth, uint32& nHeight)
@@ -228,6 +322,13 @@ LTRESULT CFearRenderer::RenderCamera(HLOCALOBJ hCamera, const char *pTechniqueOv
             (void *)hCamera, bHaveTransform ? 1 : 0, position[0], position[1], position[2]);
         fflush(stdout);
     }
+    if (pRender->SetViewportRect)
+    {
+        float cameraRect[4] = {0.0f, 0.0f, 1.0f, 1.0f};
+        FearClient_GetCameraRect(hCamera, cameraRect);
+        pRender->SetViewportRect(cameraRect);
+    }
+
     if (bHaveTransform && pRender->SetWorldCamera)
     {
         const float qx = rotation[0];
@@ -381,38 +482,55 @@ LTRESULT CFearRenderer::SetRenderTargetVisTarget(HRENDERTARGETVIS hTargetVis, HR
 
 HMATERIAL CFearRenderer::CreateMaterialInstance(const char* pszMaterialName)
 {
-    FEAR_UNIMPL_LOG("ILTRenderer::CreateMaterialInstance");
-    g_FearMaterialInstance.AddRef();
-    return reinterpret_cast<HMATERIAL>(&g_FearMaterialInstance);
+    CFearMaterialInstance *pMaterial =
+        new (std::nothrow) CFearMaterialInstance(pszMaterialName);
+    if (pMaterial)
+    {
+        printf("FEARRENDER: material instance '%s' -> %p\n",
+            pszMaterialName ? pszMaterialName : "", pMaterial);
+        fflush(stdout);
+    }
+    return reinterpret_cast<HMATERIAL>(pMaterial);
 }
 
 LTRESULT CFearRenderer::ReleaseMaterialInstance(HMATERIAL hMaterial)
 {
-    FEAR_UNIMPL_LOG("ILTRenderer::ReleaseMaterialInstance");
-    if (hMaterial == reinterpret_cast<HMATERIAL>(&g_FearMaterialInstance))
-        g_FearMaterialInstance.Release();
+    CFearMaterialInstance *pMaterial =
+        reinterpret_cast<CFearMaterialInstance *>(hMaterial);
+    if (pMaterial)
+        pMaterial->Release();
     return LT_OK;
 }
 
 LTRESULT CFearRenderer::AddRefMaterialInstance(HMATERIAL hMaterial)
 {
-    FEAR_UNIMPL_LOG("ILTRenderer::AddRefMaterialInstance");
-    if (hMaterial == reinterpret_cast<HMATERIAL>(&g_FearMaterialInstance))
-        g_FearMaterialInstance.AddRef();
+    CFearMaterialInstance *pMaterial =
+        reinterpret_cast<CFearMaterialInstance *>(hMaterial);
+    if (pMaterial)
+        pMaterial->AddRef();
     return LT_OK;
 }
 
 HMATERIAL CFearRenderer::CloneMaterialInstance(HMATERIAL hMaterial)
 {
-    FEAR_UNIMPL_LOG("ILTRenderer::CloneMaterialInstance");
-    g_FearMaterialInstance.AddRef();
-    return reinterpret_cast<HMATERIAL>(&g_FearMaterialInstance);
+    CFearMaterialInstance *pSource =
+        reinterpret_cast<CFearMaterialInstance *>(hMaterial);
+    if (!pSource)
+        return INVALID_MATERIAL;
+    CFearMaterialInstance *pClone =
+        new (std::nothrow) CFearMaterialInstance(pSource->GetName().c_str());
+    return reinterpret_cast<HMATERIAL>(pClone);
 }
 
 LTRESULT CFearRenderer::GetMaterialFileName(HMATERIAL hMaterial, char* pszBuffer, uint32 nBufferLen)
 {
-    FEAR_UNIMPL_LOG("ILTRenderer::GetMaterialFileName");
-    return SvcDefault<LTRESULT>::Get();
+    CFearMaterialInstance *pMaterial =
+        reinterpret_cast<CFearMaterialInstance *>(hMaterial);
+    if (!pMaterial || !pszBuffer || nBufferLen == 0)
+        return LT_INVALIDPARAMS;
+    strncpy(pszBuffer, pMaterial->GetName().c_str(), nBufferLen - 1);
+    pszBuffer[nBufferLen - 1] = '\0';
+    return LT_OK;
 }
 
 LTRESULT CFearRenderer::OptimizeVideoMemory()

@@ -1,6 +1,8 @@
 #include "fear_common_stub.h"
 #include "fear_object_map.h"
 #include "fear_messagewrite_stub.h"
+#include "fear_model_stub.h"
+#include "ltobjectcreate.h"
 #include <stdio.h>
 
 template <typename T> struct SvcDefault { static T Get() { return T(); } };
@@ -17,8 +19,15 @@ LTRESULT CFearCommon::SetObjectResource(HOBJECT hObj, EObjectResource eType, uin
 
 LTRESULT CFearCommon::SetObjectFilenames(HOBJECT hObj, ObjectCreateStruct* pStruct)
 {
-    printf("STUB ILTCommon::SetObjectFilenames\n");
-    return SvcDefault<LTRESULT>::Get();
+    if (!hObj || !pStruct)
+        return LT_INVALIDPARAMS;
+
+    FearModel_SetObjectFilename(hObj, pStruct->m_Filename);
+    FearClient_SetObjectType(hObj, OT_MODEL);
+    printf("FEARPORT: SetObjectFilenames obj=%p model='%s'\n",
+        (void *)hObj, pStruct->m_Filename);
+    fflush(stdout);
+    return LT_OK;
 }
 
 LTRESULT CFearCommon::GetObjectFlags(const HOBJECT hObj, const ObjFlagType flagType, uint32 &dwFlags)
@@ -47,8 +56,11 @@ LTRESULT CFearCommon::GetAttachmentObjects(HATTACHMENT hAttachment, HOBJECT &hPa
 
 LTRESULT CFearCommon::GetAttachments(HLOCALOBJ hObj, HLOCALOBJ *inList, uint32 inListSize, uint32 &outListSize, uint32 &outNumAttachments)
 {
-    printf("STUB ILTCommon::GetAttachments\n");
-    return SvcDefault<LTRESULT>::Get();
+    if (!hObj)
+        return LT_INVALIDPARAMS;
+    outListSize = 0;
+    outNumAttachments = 0;
+    return LT_OK;
 }
 
 LTRESULT CFearCommon::GetAttachedModelNodeTransform(HATTACHMENT hAttachment, HMODELNODE hNode, LTTransform &transform)
@@ -71,14 +83,19 @@ LTRESULT CFearCommon::GetAttachedModelSocketTransform(HATTACHMENT hAttachment, H
 
 LTRESULT CFearCommon::NumAttachments(HLOCALOBJ hObject, uint32 &dwAttachCount)
 {
-    printf("STUB ILTCommon::NumAttachments\n");
-    return SvcDefault<LTRESULT>::Get();
+    if (!hObject)
+        return LT_INVALIDPARAMS;
+    dwAttachCount = 0;
+    return LT_OK;
 }
 
 LTRESULT CFearCommon::GetObjectType(HOBJECT hObj, uint32 *type)
 {
-    printf("STUB ILTCommon::GetObjectType\n");
-    return SvcDefault<LTRESULT>::Get();
+    if (!hObj || !type)
+        return LT_INVALIDPARAMS;
+
+    *type = FearClient_GetObjectType(hObj);
+    return LT_OK;
 }
 
 LTRESULT CFearCommon::Parse(ConParse *pParse)
@@ -95,8 +112,15 @@ LTRESULT CFearCommon::Parse(ConParseW *pParse)
 
 LTRESULT CFearCommon::CreateMessage(ILTMessage_Write* &pMsg)
 {
-    g_FearMessageWrite.Reset();
-    pMsg = &g_FearMessageWrite;
+    pMsg = new CFearMessageWrite;
+    static int s_nCreateLogs = 0;
+    if (++s_nCreateLogs <= 4)
+    {
+        void **pVtable = *reinterpret_cast<void ***>(pMsg);
+        printf("FEARMSGW: create msg=%p vtable=%p slot9=%p slot10=%p\n",
+            (void *)pMsg, (void *)pVtable, pVtable[9], pVtable[10]);
+        fflush(stdout);
+    }
     return LT_OK;
 }
 

@@ -11,11 +11,21 @@ static uint32 FearFloatToBits(float fValue)
     return nValue;
 }
 
-CFearMessageWrite g_FearMessageWrite;
+
 
 void CFearMessageWrite::WriteBit(uint32 nPos, uint32 nValue)
 {
     uint32 nByte = nPos >> 3;
+    if (nByte > (16u << 20))
+    {
+        static int s_nHugeBitLogs = 0;
+        if (++s_nHugeBitLogs <= 8)
+        {
+            printf("FEARMSGW: huge bit write msg=%p pos=%u byte=%u size=%u capacity=%u\n",
+                (void *)this, nPos, nByte, m_nBitPos, (unsigned)m_Data.size());
+            fflush(stdout);
+        }
+    }
     if (nByte >= m_Data.size())
         m_Data.resize(nByte + 1, 0);
 
@@ -32,10 +42,32 @@ void CFearMessageWrite::Reset()
     m_nBitPos = 0;
 }
 
+void CFearMessageWrite::AddRef()
+{
+    ++m_nRefs;
+}
+
+void CFearMessageWrite::Release()
+{
+    if (--m_nRefs <= 0)
+        delete this;
+}
+
+void CFearMessageWrite::StaticRelease()
+{
+    Release();
+}
+
+void CFearMessageWrite::Free()
+{
+    Release();
+}
+
 ILTMessage_Read * CFearMessageWrite::Read()
 {
-    g_FearMessageRead.SetData(m_Data.empty() ? NULL : &m_Data[0], m_nBitPos);
-    return &g_FearMessageRead;
+    CFearMessageRead *pRead = new CFearMessageRead;
+    pRead->SetData(m_Data.empty() ? NULL : &m_Data[0], m_nBitPos);
+    return pRead;
 }
 
 uint32 CFearMessageWrite::Size() const
@@ -69,6 +101,16 @@ void CFearMessageWrite::WriteData(const void *pData, uint32 nSize)
 {
     if (!pData || (nSize == 0))
         return;
+    if (nSize > (16u << 20))
+    {
+        static int s_nHugeDataLogs = 0;
+        if (++s_nHugeDataLogs <= 8)
+        {
+            printf("FEARMSGW: huge data write msg=%p pos=%u size=%u\n",
+                (void *)this, m_nBitPos, nSize);
+            fflush(stdout);
+        }
+    }
 
     const uint8 *pBytes = (const uint8 *)pData;
     for (uint32 i = 0; i < nSize; i++)
@@ -111,10 +153,22 @@ void CFearMessageWrite::WriteString(const char *pString)
 {
     if (!pString)
         pString = "";
+    uint32 nLength = 0;
     while (*pString)
     {
         WriteBits((uint32)(uint8)*pString, 8);
         ++pString;
+        if ((++nLength & 0xFFF) == 0 && nLength > 0x100000)
+        {
+            static int s_nLongStringLogs = 0;
+            if (++s_nLongStringLogs <= 8)
+            {
+                printf("FEARMSGW: long string write msg=%p pos=%u length=%u\n",
+                    (void *)this, m_nBitPos, nLength);
+                fflush(stdout);
+            }
+            break;
+        }
     }
     WriteBits(0, 8);
 }
@@ -154,7 +208,9 @@ void CFearMessageWrite::WriteCompLTRotation(const LTRotation &cRotation)
 void CFearMessageWrite::WriteObject(HOBJECT hObj)
 {
     unsigned short nServerId = FearClient_GetServerObjectId(hObj);
-    WriteBits(nServerId, 16);
+    if (nServerId == 0xFFFF)
+        nServerId = FEAR_INVALID_OBJECT_ID;
+    WriteBits(nServerId, 15);
 }
 
 void CFearMessageWrite::WriteYRotation(const LTRotation &cRotation)
